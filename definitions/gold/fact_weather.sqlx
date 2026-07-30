@@ -1,0 +1,93 @@
+config {
+    type: "table",
+    schema: "sf_traffic_gold",
+    name: "fact_weather",
+    description: "Fact Table - Weather Observations (Ánh xạ chuẩn Star Schema)",
+    tags: ["gold", "fact", "weather"],
+    assertions: {
+        nonNull: ["date_key", "time_key", "weather_timestamp"]
+    },
+    bigquery: {
+        partitionBy: "DATE(weather_timestamp)",
+        clusterBy: ["weathercode"]
+    }
+}
+
+WITH
+--------------------------------------------------------------------------------
+-- Stage 1 : Source & Basic Quality
+--------------------------------------------------------------------------------
+source AS (
+    SELECT *
+    FROM ${ref("slv_weather")}
+    WHERE weather_timestamp IS NOT NULL
+      AND (temperature_2m BETWEEN -80 AND 80 OR temperature_2m IS NULL)
+      AND (wind_speed_10m >= 0 OR wind_speed_10m IS NULL)
+),
+
+--------------------------------------------------------------------------------
+-- Stage 2 : Lookup Date & Time
+--------------------------------------------------------------------------------
+map_date AS (
+    SELECT 
+        s.*, 
+        d.date_key
+    FROM source s
+    LEFT JOIN ${ref("dim_date")} d 
+        ON DATE(s.weather_timestamp) = d.full_date
+),
+
+map_time AS (
+    SELECT 
+        d_cte.*, 
+        t.time_key
+    FROM map_date d_cte
+    LEFT JOIN ${ref("dim_time")} t 
+        ON TIME_TRUNC(TIME(d_cte.weather_timestamp), MINUTE) = t.full_time
+),
+
+--------------------------------------------------------------------------------
+-- Stage 3 : Fact Construction
+--------------------------------------------------------------------------------
+fact_base AS (
+    SELECT
+        CAST(CONCAT(
+            CAST(location_id AS STRING),
+            CAST(date_key AS STRING),
+            CAST(time_key AS STRING)
+        ) AS INT64) AS weather_fact_key,
+        
+        date_key,
+        time_key,
+        location_id,
+        location_name,
+        weather_timestamp,
+        timezone,
+        utc_offset_seconds,
+        temperature_2m,
+        apparent_temperature,
+        rain_mm,
+        snowfall_cm,
+        snow_depth_m,
+        weathercode,
+        wind_speed_10m,
+        wind_gusts_10m,
+        latitude,
+        longitude,
+        location_geography
+    FROM map_time
+),
+
+--------------------------------------------------------------------------------
+-- Stage 4 : Deduplication
+--------------------------------------------------------------------------------
+deduplicated AS (
+    SELECT *
+    FROM fact_base
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY weather_timestamp
+        ORDER BY weather_timestamp DESC
+    ) = 1
+)
+
+SELECT * FROM deduplicated

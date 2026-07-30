@@ -1,0 +1,59 @@
+config {
+    type: "table",
+    schema: "sf_traffic_gold",
+    name: "dim_traffic_signal",
+    description: "Traffic Signal Dimension",
+    tags: ["gold", "dimension"],
+    assertions: {
+        uniqueKey: ["signal_key"],
+        nonNull: ["signal_key", "signal_id"]
+    }
+}
+
+WITH source AS (
+    SELECT *
+    FROM ${ref("slv_traffic_signal")}
+),
+cleaned AS (
+    SELECT 
+        signal_id,
+        cnn,
+        street_1,
+        street_2,
+        street_3,
+        street_4,
+        type,
+        detection,
+        system_number,
+        master,
+        bbs,
+        vehicle_actuation,
+        pedestrian_signal,
+        pedestrian_actuation,
+        tbc,
+        interconnection,
+        preemption,
+        controller_date,
+        red_light_camera,
+        start_year,
+        caltrans_route,
+        caltrans,
+        accessible_pedestrian_signal,
+        analysis_neighborhood,
+        supervisor_district,
+        sf,
+        geography
+    FROM source
+    WHERE signal_id IS NOT NULL
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY signal_id 
+        ORDER BY signal_id
+    ) = 1
+),
+final AS (
+    SELECT
+        ROW_NUMBER() OVER(ORDER BY signal_id) AS signal_key,
+        *
+    FROM cleaned
+)
+SELECT * FROM final

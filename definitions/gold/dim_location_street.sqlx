@@ -1,0 +1,100 @@
+config {
+    type: "table",
+    schema: "sf_traffic_gold",
+    name: "dim_location_street",
+    description: "Location Dimension - Street network, speed limits, and sensor presence",
+    tags: ["gold", "dimension"],
+    assertions: {
+        uniqueKey: ["location_key"],
+        nonNull: ["location_key", "cnn"]
+    }
+}
+
+WITH 
+signal_mapping AS (
+    SELECT DISTINCT cnn AS signal_cnn
+    FROM ${ref("slv_traffic_signal")}
+    WHERE cnn IS NOT NULL
+),
+camera_mapping AS (
+    SELECT DISTINCT s.cnn
+    FROM ${ref("slv_street")} s
+    JOIN ${ref("slv_camera")} c
+    ON ST_DWithin(s.geography, c.geography, 30)
+),
+-- BỔ SUNG CTE NÀY: Lọc để mỗi cnn chỉ lấy 1 dòng speed_limit duy nhất
+speed_limit_dedup AS (
+    SELECT *
+    FROM ${ref("slv_speed_limit")}
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY cnn ORDER BY object_id DESC) = 1
+),
+final AS (
+    SELECT
+        s.cnn AS location_key,
+        s.cnn,
+        s.street,
+        TRIM(s.street_name) AS street_name,
+        s.street_type,
+        s.street_gc,
+        s.street_name_gc,
+        s.from_street,
+        s.to_street,
+        s.from_node,
+        s.to_node,
+        s.class_code,
+        CASE CAST(s.class_code AS INT64)
+            WHEN 1 THEN 'Freeway'
+            WHEN 2 THEN 'Major street/Highway'
+            WHEN 3 THEN 'Arterial street'
+            WHEN 4 THEN 'Collector Street'
+            WHEN 5 THEN 'Residential Street'
+            WHEN 6 THEN 'Freeway Ramp'
+            ELSE 'Other (private, paper street, etc.)'
+        END AS street_class,
+        s.jurisdiction,
+        s.neighborhood,
+        s.analysis_neighborhood,
+        s.supervisor_district,
+        s.zip_code,
+        s.oneway,
+        s.accepted,
+        s.active,
+        
+        -- Dùng dữ liệu từ CTE đã lọc trùng
+        COALESCE(sp.speed_limit, 25) AS speed_limit,
+        COALESCE(sp.school_zone, FALSE) AS is_schoolzone,
+        sp.school_zone_limit,
+        sp.status AS speed_status,
+        
+        CASE
+            WHEN sp.speed_limit = 99 THEN 'Freeway / Interstate'
+            WHEN sp.speed_limit = 15 THEN 'Alley / Narrow Street (15 MPH)'
+            WHEN COALESCE(sp.speed_limit, 25) = 25 THEN 'Residential / Commercial (25 MPH)'
+            ELSE 'Standard Street'
+        END AS speed_category,
+        
+        CASE WHEN cam.cnn IS NOT NULL THEN TRUE ELSE FALSE END AS has_camera,
+        
+        CASE
+            WHEN sig_seg.signal_cnn IS NOT NULL
+              OR sig_fnode.signal_cnn IS NOT NULL
+              OR sig_tnode.signal_cnn IS NOT NULL
+             THEN TRUE
+            ELSE FALSE
+        END AS has_signal,
+        
+        s.geography
+    FROM ${ref("slv_street")} s
+    -- Đổi thành LEFT JOIN với CTE mới tạo
+    LEFT JOIN speed_limit_dedup sp 
+        ON s.cnn = sp.cnn
+    LEFT JOIN camera_mapping cam 
+        ON s.cnn = cam.cnn
+    LEFT JOIN signal_mapping sig_seg 
+        ON s.cnn = sig_seg.signal_cnn
+    LEFT JOIN signal_mapping sig_fnode 
+        ON s.from_node = sig_fnode.signal_cnn
+    LEFT JOIN signal_mapping sig_tnode 
+        ON s.to_node = sig_tnode.signal_cnn
+)
+SELECT * FROM final

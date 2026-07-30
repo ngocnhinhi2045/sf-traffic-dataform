@@ -1,0 +1,173 @@
+config {
+    type: "table",
+    schema: "sf_traffic_gold",
+    name: "fact_traffic_incident",
+    description: "Fact Table - Traffic Incidents (Ánh xạ chuẩn Star Schema)",
+    tags: ["gold", "fact", "incident"],
+    assertions: {
+        nonNull: ["incident_id", "date_key", "time_key"]
+    },
+    bigquery: {
+        partitionBy: "DATE(updated)",
+        clusterBy: ["severity", "status", "event_type"]
+    }
+}
+
+WITH 
+--------------------------------------------------------------------------------
+-- Stage 1 : Source
+--------------------------------------------------------------------------------
+source AS (
+    SELECT *
+    FROM ${ref("slv_traffic_incident")}
+    WHERE incident_id IS NOT NULL 
+      AND geography IS NOT NULL
+),
+
+--------------------------------------------------------------------------------
+-- Stage 2 : Lookup Date & Time Dimensions
+--------------------------------------------------------------------------------
+map_date AS (
+    SELECT 
+        s.*, 
+        d.date_key
+    FROM source s
+    LEFT JOIN ${ref("dim_date")} d 
+        ON DATE(COALESCE(s.updated, CURRENT_TIMESTAMP())) = d.full_date
+),
+
+map_time AS (
+    SELECT 
+        d_cte.*, 
+        t.time_key
+    FROM map_date d_cte
+    LEFT JOIN ${ref("dim_time")} t 
+        ON TIME_TRUNC(TIME(COALESCE(d_cte.updated, CURRENT_TIMESTAMP())), MINUTE) = t.full_time
+),
+
+--------------------------------------------------------------------------------
+-- Stage 3 : Spatial & Network Mapping 
+--------------------------------------------------------------------------------
+map_location AS (
+    SELECT 
+        i.incident_id, 
+        loc.location_key,
+        ST_Distance(i.geography, loc.geography) AS matched_distance_meter
+    FROM map_time i
+    JOIN ${ref("dim_location_street")} loc
+        ON ST_DWithin(i.geography, loc.geography, 300) 
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY i.incident_id 
+        ORDER BY 
+            -- TRỌNG SỐ 1: Khớp tên đường sự cố với bảng Dimension
+            CASE 
+                WHEN STRPOS(UPPER(TRIM(i.roads_name)), UPPER(TRIM(loc.street_name))) > 0 THEN 0 
+                ELSE 1 
+            END ASC,
+            -- TRỌNG SỐ 2: Khoảng cách vật lý
+            ST_Distance(i.geography, loc.geography) ASC
+    ) = 1
+),
+
+map_camera AS (
+    SELECT 
+        i.incident_id, 
+        cam.camera_key
+    FROM map_time i
+    JOIN ${ref("dim_camera")} cam
+        ON ST_DWithin(i.geography, cam.geography, 500) 
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY i.incident_id ORDER BY ST_Distance(i.geography, cam.geography) ASC) = 1
+),
+
+map_signal AS (
+    SELECT 
+        i.incident_id, 
+        sig.signal_key
+    FROM map_time i
+    JOIN ${ref("dim_traffic_signal")} sig 
+        ON ST_DWithin(i.geography, sig.geography, 500)
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY i.incident_id ORDER BY ST_Distance(i.geography, sig.geography) ASC) = 1
+),
+
+map_police AS (
+    SELECT 
+        i.incident_id, 
+        ps.police_station_key,
+        ST_Distance(i.geography, ps.geography) AS police_distance_meter
+    FROM map_time i
+    CROSS JOIN ${ref("dim_police_station")} ps
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY i.incident_id ORDER BY ST_Distance(i.geography, ps.geography) ASC) = 1
+),
+
+--------------------------------------------------------------------------------
+-- Stage 4 : Spatial Lookups cho Neighborhood
+--------------------------------------------------------------------------------
+map_neighborhood AS (
+    SELECT 
+        i.incident_id, 
+        n.neighborhood_key
+    FROM map_time i
+    -- Đổi thành JOIN không gian
+    JOIN ${ref("dim_neighborhood")} n 
+        ON ST_Intersects(i.geography, n.geography)
+    -- BỔ SUNG ORDER BY ĐỂ ĐÁP ỨNG CÚ PHÁP CỦA BIGQUERY VÀ XỬ LÝ TRÙNG LẶP
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY i.incident_id 
+        ORDER BY n.neighborhood_key ASC
+    ) = 1
+),
+
+--------------------------------------------------------------------------------
+-- Stage 5 : Fact Construction
+--------------------------------------------------------------------------------
+fact_base AS (
+    SELECT
+        s.date_key,
+        s.time_key,
+        ml.location_key,
+        mn.neighborhood_key,
+        mc.camera_key,
+        ms.signal_key,
+        mp.police_station_key, -- [BỔ SUNG CỘT NÀY]
+        s.incident_id,
+        s.created_at,
+        s.updated,
+        s.event_type,
+        s.event_subtypes,
+        s.status,
+        s.severity,
+        s.headline,
+        s.schedule_interval,
+        s.areas_name,
+        s.roads_direction,
+        s.roads_state,
+        s.roads_lane_status,
+        s.roads_road_advisory,
+        s.roads_from,
+        s.roads_to,
+        s.roads_lane_type,
+        s.roads_article,
+        ml.matched_distance_meter,
+        mp.police_distance_meter, -- [BỔ SUNG NẾU BẠN MUỐN GHI NHẬN KHOẢNG CÁCH ĐẾN TRẠM]
+        s.geography
+    FROM map_time s
+    LEFT JOIN map_location ml ON s.incident_id = ml.incident_id
+    LEFT JOIN map_camera mc ON s.incident_id = mc.incident_id
+    LEFT JOIN map_signal ms ON s.incident_id = ms.incident_id
+    LEFT JOIN map_neighborhood mn ON s.incident_id = mn.incident_id
+    LEFT JOIN map_police mp ON s.incident_id = mp.incident_id -- [BỔ SUNG PHÉP JOIN NÀY]
+),
+
+--------------------------------------------------------------------------------
+-- Stage 6 : Deduplication
+--------------------------------------------------------------------------------
+deduplicated AS (
+    SELECT *
+    FROM fact_base
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY incident_id 
+        ORDER BY updated DESC
+    ) = 1
+)
+
+SELECT * FROM deduplicated

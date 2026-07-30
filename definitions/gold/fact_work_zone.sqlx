@@ -1,0 +1,127 @@
+config {
+    type: "table",
+    schema: "sf_traffic_gold",
+    name: "fact_work_zone",
+    description: "Fact Table - Road Work Zones (Ánh xạ chuẩn Star Schema)",
+    tags: ["gold", "fact", "work_zone"],
+    assertions: {
+        nonNull: ["work_zone_id", "start_date_key", "location_key"]
+    },
+    bigquery: {
+        partitionBy: "DATE(start_date)",
+        clusterBy: ["event_type", "event_status", "vehicle_impact"]
+    }
+}
+
+WITH
+--------------------------------------------------------------------------------
+-- Stage 1 : Source
+--------------------------------------------------------------------------------
+source AS (
+    SELECT *
+    FROM ${ref("slv_work_zone")}
+    WHERE work_zone_id IS NOT NULL
+      AND start_date IS NOT NULL
+),
+
+--------------------------------------------------------------------------------
+-- Stage 2 : Lookup Date & Time (Cho cả Start và End)
+--------------------------------------------------------------------------------
+map_time_keys AS (
+    SELECT 
+        s.*,
+        d_start.date_key AS start_date_key,
+        t_start.time_key AS start_time_key,
+        d_end.date_key AS end_date_key,
+        t_end.time_key AS end_time_key
+    FROM source s
+    LEFT JOIN ${ref("dim_date")} d_start 
+        ON DATE(s.start_date) = d_start.full_date
+    LEFT JOIN ${ref("dim_time")} t_start 
+        ON TIME_TRUNC(TIME(s.start_date), MINUTE) = t_start.full_time
+    LEFT JOIN ${ref("dim_date")} d_end 
+        ON DATE(s.end_date) = d_end.full_date
+    LEFT JOIN ${ref("dim_time")} t_end 
+        ON TIME_TRUNC(TIME(s.end_date), MINUTE) = t_end.full_time
+),
+
+--------------------------------------------------------------------------------
+-- Stage 3 : Spatial Lookup
+--------------------------------------------------------------------------------
+map_location AS (
+    SELECT
+        w.work_zone_id,
+        loc.location_key,
+        -- Có thể giữ lại khoảng cách để kiểm chứng
+        ST_Distance(w.geography, loc.geography) AS distance
+    FROM map_time_keys w
+    JOIN ${ref("dim_location_street")} loc
+        -- Quét tất cả các đường trong bán kính 100m
+        ON ST_DWithin(w.geography, loc.geography, 100) 
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY w.work_zone_id 
+        ORDER BY 
+            -- TRỌNG SỐ 1: Ưu tiên tên đường khớp nhau (Dùng UPPER và TRIM để chuẩn hóa)
+            -- Nếu trong tên đường gốc có chứa tên của bảng Dim, gán hạng 0 (lên đầu), ngược lại hạng 1
+            CASE 
+                WHEN STRPOS(UPPER(TRIM(w.road_name)), UPPER(TRIM(loc.street_name))) > 0 THEN 0 
+                ELSE 1 
+            END ASC,
+            
+            -- TRỌNG SỐ 2: Nếu cùng hạng (cùng khớp hoặc cùng không khớp), lấy khoảng cách gần nhất
+            ST_Distance(w.geography, loc.geography) ASC
+    ) = 1
+),
+
+map_neighborhood AS (
+    SELECT
+        w.work_zone_id,
+        n.neighborhood_key
+    FROM map_time_keys w
+    JOIN ${ref("dim_neighborhood")} n
+        ON ST_Intersects(w.geography, n.geography)
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY w.work_zone_id) = 1
+),
+
+--------------------------------------------------------------------------------
+-- Stage 4 : Fact Construction
+--------------------------------------------------------------------------------
+fact_base AS (
+    SELECT
+        CAST(FARM_FINGERPRINT(s.work_zone_id) AS INT64) AS event_key,
+        s.work_zone_id,
+        s.data_source_id,
+        s.start_date_key,
+        s.start_time_key,
+        s.end_date_key,
+        s.end_time_key,
+        COALESCE(ml.location_key, -1) AS location_key,
+        mn.neighborhood_key,
+        s.start_date,
+        s.end_date,
+        s.event_type,
+        s.direction,
+        s.description,
+        s.event_status,
+        s.vehicle_impact,
+        s.beginning_cross_street,
+        s.ending_cross_street,
+        s.geography
+    FROM map_time_keys s
+    LEFT JOIN map_location ml ON s.work_zone_id = ml.work_zone_id
+    LEFT JOIN map_neighborhood mn ON s.work_zone_id = mn.work_zone_id
+),
+
+--------------------------------------------------------------------------------
+-- Stage 5 : Deduplication
+--------------------------------------------------------------------------------
+deduplicated AS (
+    SELECT *
+    FROM fact_base
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY work_zone_id 
+        ORDER BY start_date DESC
+    ) = 1
+)
+
+SELECT * FROM deduplicated

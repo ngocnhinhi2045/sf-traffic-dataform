@@ -1,0 +1,15 @@
+config {
+    type: "table",
+    schema: "sf_traffic_silver",
+    name: "slv_station_metadata",
+    tags: ["silver", "metadata"]
+}
+
+SELECT
+    ID AS station_id,
+    County AS county_identifier,
+    Latitude AS latitude,
+    Longitude AS longitude,
+    Name AS station_name
+FROM ${ref("ext_station_metadata")}
+WHERE ID IS NOT NULL

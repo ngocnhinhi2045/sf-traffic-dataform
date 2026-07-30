@@ -1,0 +1,156 @@
+config {
+    type: "table",
+    schema: "sf_traffic_silver",
+    name: "slv_camera",
+    description: "Silver layer - Standardized traffic camera dataset from CSV source",
+    tags: ["silver", "camera"],
+    columns: {
+        camera_id: "Unique camera identifier",
+        record_timestamp: "Camera capture timestamp",
+        geography: "Camera location (WGS84)",
+        district: "Caltrans district"
+    },
+    assertions: {
+        nonNull: ["camera_id", "record_timestamp", "geography"],
+        uniqueKey: ["camera_id"]
+    },
+    bigquery: {
+        partitionBy: "DATE(record_timestamp)",
+        clusterBy: ["district", "county", "route"]
+    }
+}
+
+--------------------------------------------------------------------------------
+-- Stage 1 : Source
+--------------------------------------------------------------------------------
+WITH source AS (
+    SELECT *
+    FROM ${ref("ext_camera")}
+),
+
+--------------------------------------------------------------------------------
+-- Stage 2 : Schema Standardization (Ép kiểu an toàn cho CSV)
+--------------------------------------------------------------------------------
+standardized AS (
+    SELECT
+        -- Xử lý số: Trim khoảng trắng trước khi cast để tránh lỗi
+        SAFE_CAST(TRIM(CAST(index AS STRING)) AS INT64)       AS camera_id,
+        SAFE_CAST(TRIM(CAST(district AS STRING)) AS INT64)    AS district,
+        SAFE_CAST(TRIM(CAST(elevation AS STRING)) AS FLOAT64) AS elevation,
+        SAFE_CAST(TRIM(CAST(longitude AS STRING)) AS FLOAT64) AS longitude,
+        SAFE_CAST(TRIM(CAST(latitude AS STRING)) AS FLOAT64)  AS latitude,
+        SAFE_CAST(TRIM(CAST(postmile AS STRING)) AS FLOAT64)  AS postmile,
+        SAFE_CAST(TRIM(CAST(milepost AS STRING)) AS FLOAT64)  AS milepost,
+
+        -- Giữ nguyên chuỗi để xử lý ở bước sau
+        TRIM(CAST(recordDate AS STRING))                      AS record_date,
+        TRIM(CAST(recordTime AS STRING))                      AS record_time,
+
+        -- Xử lý Text: TRIM toàn bộ để loại bỏ dấu cách thừa trong CSV
+        TRIM(CAST(locationName AS STRING))                    AS location_name,
+        TRIM(CAST(nearbyPlace AS STRING))                     AS nearby_place,
+        TRIM(CAST(direction AS STRING))                       AS direction,
+        TRIM(CAST(county AS STRING))                          AS county,
+        TRIM(CAST(route AS STRING))                           AS route,
+        TRIM(CAST(routeSuffix AS STRING))                     AS route_suffix,
+        TRIM(CAST(postmilePrefix AS STRING))                  AS postmile_prefix,
+        TRIM(CAST(alignment AS STRING))                       AS alignment,
+        TRIM(CAST(streamingVideoURL AS STRING))               AS streaming_video_url,
+        TRIM(CAST(currentImageURL AS STRING))                 AS current_image_url,
+
+        -- Xử lý Boolean chuyên trị CSV (Lấy logic từ Cách 1)
+        CASE 
+            WHEN UPPER(TRIM(CAST(inService AS STRING))) IN ('1.0', '1', 'TRUE') THEN TRUE 
+            ELSE FALSE 
+        END AS in_service
+
+    FROM source
+),
+
+--------------------------------------------------------------------------------
+-- Stage 3 : Data Cleansing
+--------------------------------------------------------------------------------
+cleaned AS (
+    SELECT *
+    FROM standardized
+    WHERE camera_id IS NOT NULL 
+      -- Có thể lọc thêm các dòng rác (header thừa) nếu file CSV bị lỗi
+      AND record_date != 'recordDate' 
+      
+      -- BỔ SUNG BỘ LỌC SAN FRANCISCO:
+      AND UPPER(county) = 'SAN FRANCISCO'
+),
+
+--------------------------------------------------------------------------------
+-- Stage 4 : Data Transformation
+--------------------------------------------------------------------------------
+transformed AS (
+    SELECT
+        *,
+        -- Ghép chuỗi và cast an toàn (Logic Cách 1 rất tốt cho CSV)
+        SAFE_CAST(CONCAT(record_date, ' ', record_time) AS TIMESTAMP) AS record_timestamp,
+        
+        -- Tạo tọa độ an toàn (Nếu lat/long bị null do lỗi cast ở bước 2, nó sẽ ra NULL)
+        ST_GEOGPOINT(longitude, latitude) AS geography
+    FROM cleaned
+),
+
+--------------------------------------------------------------------------------
+-- Stage 5 : Data Quality Validation (Cực kỳ quan trọng với CSV)
+--------------------------------------------------------------------------------
+validated AS (
+    SELECT *
+    FROM transformed
+    WHERE 
+        -- Lọc tọa độ rác (CSVs hay có vĩ độ/kinh độ bị đảo ngược hoặc = 0)
+        latitude BETWEEN -90 AND 90
+        AND longitude BETWEEN -180 AND 180
+        AND geography IS NOT NULL
+        AND record_timestamp IS NOT NULL
+),
+
+--------------------------------------------------------------------------------
+-- Stage 6 : Deduplication
+--------------------------------------------------------------------------------
+deduplicated AS (
+    SELECT *
+    FROM validated
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY camera_id
+        ORDER BY record_timestamp DESC
+    ) = 1
+),
+
+--------------------------------------------------------------------------------
+-- Stage 7 : Publish
+--------------------------------------------------------------------------------
+final AS (
+    SELECT
+        camera_id,
+        record_timestamp,
+        district,
+        location_name,
+        nearby_place,
+        county,
+        route,
+        route_suffix,
+        direction,
+        elevation,
+        postmile_prefix,
+        postmile,
+        alignment,
+        milepost,
+        longitude,
+        latitude,
+        geography,
+        in_service,
+        streaming_video_url,
+        current_image_url,
+        CURRENT_TIMESTAMP() AS _etl_loaded_at,
+        "csv_ext_camera" AS _source_system,
+        "Silver" AS _layer,
+        "1.1" AS _pipeline_version
+    FROM deduplicated
+)
+
+SELECT * FROM final

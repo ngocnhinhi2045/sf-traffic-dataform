@@ -1,0 +1,64 @@
+config {
+    type: "table",
+    schema: "sf_traffic_gold",
+    name: "dim_time",
+    description: "Bảng Dimension Thời gian (Phân giải theo phút, phân loại Giờ cao điểm và Hành chính)",
+    tags: ["gold", "dimension"],
+    assertions: {
+        uniqueKey: ["time_key"],
+        nonNull: ["time_key", "full_time"]
+    }
+}
+
+WITH hour_spine AS (
+    SELECT h AS hour FROM UNNEST(GENERATE_ARRAY(0, 23)) AS h
+),
+minute_spine AS (
+    SELECT m AS minute FROM UNNEST(GENERATE_ARRAY(0, 59)) AS m
+),
+time_spine AS (
+    SELECT
+        hour,
+        minute,
+        -- Tạo Time_Key định dạng HHMM (Ví dụ: 08:30 sáng -> 830)
+        CAST(hour * 100 + minute AS INT64) AS time_key,
+        TIME(hour, minute, 0) AS full_time,
+        FORMAT("%02d:%02d", hour, minute) AS hour_name
+    FROM hour_spine CROSS JOIN minute_spine
+),
+final AS (
+    SELECT
+        time_key,
+        full_time,
+        hour,
+        minute,
+        hour_name,
+        -- Phân loại thời điểm trong ngày
+        CASE
+            WHEN hour >= 5 AND hour < 11 THEN 'Morning'
+            WHEN hour >= 11 AND hour <= 13 THEN 'Midday'
+            WHEN hour >= 14 AND hour <= 17 THEN 'Afternoon'
+            WHEN hour >= 18 AND hour <= 21 THEN 'Evening'
+            ELSE 'Night'
+        END AS time_category,
+        
+        -- Đánh dấu Giờ cao điểm (7h-9h và 16h-18h)
+        CASE
+            WHEN (hour >= 7 AND hour <= 9) OR (hour >= 16 AND hour <= 18) THEN TRUE
+            ELSE FALSE
+        END AS is_rush_hour,
+        
+        -- Đánh dấu Giờ hành chính (8h-17h)
+        CASE
+            WHEN hour >= 8 AND hour <= 17 THEN TRUE
+            ELSE FALSE
+        END AS is_business_hour,
+        
+        -- Đánh dấu Ban đêm (22h đến trước 5h sáng hôm sau)
+        CASE
+            WHEN hour >= 22 OR hour < 5 THEN TRUE
+            ELSE FALSE
+        END AS is_night
+    FROM time_spine
+)
+SELECT * FROM final

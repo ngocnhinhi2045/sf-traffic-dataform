@@ -1,0 +1,136 @@
+config {
+    type: "table",
+    schema: "sf_traffic_silver",
+    name: "slv_work_zone",
+    description: "Silver layer - Standardized work zone dataset (Optimized for Traffic Police)",
+    tags: ["silver", "work_zone", "fact"],
+    columns: {
+        work_zone_id: "Work zone identifier",
+        geography: "Work zone geometry"
+    },
+    assertions: {
+        nonNull: [
+            "work_zone_id",
+            "geography"
+        ],
+        uniqueKey: [
+            "work_zone_id"
+        ]
+    },
+    bigquery: {
+        partitionBy: "DATE(start_date)",
+        clusterBy: [
+            "event_status",
+            "vehicle_impact"
+        ]
+    }
+}
+
+--------------------------------------------------------------------------------
+-- Stage 1 : Source
+--------------------------------------------------------------------------------
+WITH source AS (
+    SELECT *
+    FROM ${ref("raw_work_zone")}
+),
+
+--------------------------------------------------------------------------------
+-- Stage 2 : Schema Standardization (Tinh gọn, chỉ giữ lại những gì CSGT thực sự cần)
+--------------------------------------------------------------------------------
+standardized AS (
+    SELECT
+        TRIM(CAST(id AS STRING)) AS work_zone_id,
+        
+        -- Thông tin cốt lõi phục vụ điều tiết giao thông
+        JSON_VALUE(properties, '$.core_details.event_type') AS event_type,
+        JSON_VALUE(properties, '$.core_details.data_source_id') AS data_source_id,
+        JSON_VALUE(properties, '$.core_details.road_names[0]') AS road_name, -- Giữ lại tên đường chính là đủ dùng
+        JSON_VALUE(properties, '$.core_details.direction') AS direction,
+        JSON_VALUE(properties, '$.core_details.description') AS description,
+        
+        SAFE_CAST(JSON_VALUE(properties, '$.start_date') AS TIMESTAMP) AS start_date,
+        SAFE_CAST(JSON_VALUE(properties, '$.end_date') AS TIMESTAMP) AS end_date,
+        
+        -- Dùng update_date để bắt bản ghi mới nhất
+        SAFE_CAST(JSON_VALUE(properties, '$.core_details.update_date') AS TIMESTAMP) AS update_date,
+        
+        JSON_VALUE(properties, '$.event_status') AS event_status,
+        JSON_VALUE(properties, '$.vehicle_impact') AS vehicle_impact,
+        JSON_VALUE(properties, '$.beginning_cross_street') AS beginning_cross_street,
+        JSON_VALUE(properties, '$.ending_cross_street') AS ending_cross_street,
+        
+        -- Không gian (GeoJSON để vẽ bản đồ GIS)
+        ST_GEOGFROMGEOJSON(CAST(geometry AS STRING)) AS geography
+
+    FROM source
+),
+
+--------------------------------------------------------------------------------
+-- Stage 3 : Data Cleansing
+--------------------------------------------------------------------------------
+cleaned AS (
+    SELECT 
+        s.* -- Chỉ lấy các cột của bảng standardized, bỏ qua cột của neighborhood
+    FROM standardized s
+    -- Sử dụng INNER JOIN thay cho EXISTS để BigQuery kích hoạt Spatial Join
+    JOIN ${ref("slv_neighborhood")} n
+        ON ST_INTERSECTS(s.geography, n.geography)
+    WHERE s.work_zone_id IS NOT NULL
+),
+
+--------------------------------------------------------------------------------
+-- Stage 4 : Data Transformation
+--------------------------------------------------------------------------------
+transformed AS (
+    SELECT *
+    FROM cleaned
+),
+
+--------------------------------------------------------------------------------
+-- Stage 5 : Validation
+--------------------------------------------------------------------------------
+validated AS (
+    SELECT *
+    FROM transformed
+    WHERE geography IS NOT NULL
+),
+
+--------------------------------------------------------------------------------
+-- Stage 6 : Deduplication (Sửa lại: Chỉ lấy dòng cập nhật mới nhất)
+--------------------------------------------------------------------------------
+deduplicated AS (
+    SELECT *
+    FROM validated
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY work_zone_id 
+        ORDER BY update_date DESC
+    ) = 1
+),
+
+--------------------------------------------------------------------------------
+-- Stage 7 : Publish
+--------------------------------------------------------------------------------
+final AS (
+    SELECT 
+        work_zone_id,
+        event_type,
+        data_source_id,
+        road_name,
+        direction,
+        description,
+        start_date,
+        end_date,
+        event_status,
+        vehicle_impact,
+        beginning_cross_street,
+        ending_cross_street,
+        geography,
+        
+        CURRENT_TIMESTAMP() AS _etl_loaded_at,
+        "raw_work_zone" AS _source_system,
+        "Silver" AS _layer,
+        "1.1" AS _pipeline_version
+    FROM deduplicated
+)
+
+SELECT * FROM final

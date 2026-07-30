@@ -1,0 +1,120 @@
+config {
+    type: "table",
+    schema: "sf_traffic_gold",
+    name: "fact_traffic_flow",
+    description: "Fact Table - Hourly traffic observations from Caltrans PeMS (Star Schema)",
+    tags: ["gold", "fact", "traffic_flow"],
+    assertions: {
+        nonNull: ["flow_key", "date_key", "time_key", "station_id", "flow_timestamp"]
+    },
+    bigquery: {
+        partitionBy: "DATE(flow_timestamp)",
+        clusterBy: ["station_id", "district", "route"]
+    }
+}
+
+WITH
+--------------------------------------------------------------------------------
+-- Stage 1 : Source & Basic Filtering
+--------------------------------------------------------------------------------
+source AS (
+    SELECT *
+    FROM ${ref("slv_traffic_flow")}
+    WHERE flow_timestamp IS NOT NULL
+      AND station_id IS NOT NULL
+      -- Lọc các lỗi vật lý cơ bản (không thể có số âm)
+      AND total_flow >= 0
+      AND avg_occupancy >= 0
+      AND avg_speed >= 0
+),
+
+--------------------------------------------------------------------------------
+-- Stage 2 : Lookup Date & Time
+--------------------------------------------------------------------------------
+map_date AS (
+    SELECT 
+        s.*, 
+        d.date_key
+    FROM source s
+    LEFT JOIN ${ref("dim_date")} d 
+        ON DATE(s.flow_timestamp) = d.full_date
+),
+
+map_time AS (
+    SELECT 
+        d_cte.*, 
+        t.time_key
+    FROM map_date d_cte
+    LEFT JOIN ${ref("dim_time")} t 
+        ON TIME_TRUNC(TIME(d_cte.flow_timestamp), MINUTE) = t.full_time
+),
+
+--------------------------------------------------------------------------------
+-- Stage 3 : Fact Construction & Data Quality Profiling
+--------------------------------------------------------------------------------
+fact_base AS (
+    SELECT
+        -- Surrogate Key an toàn chống tràn số
+        CAST(FARM_FINGERPRINT(CONCAT(
+            CAST(station_id AS STRING), '|', 
+            CAST(flow_timestamp AS STRING)
+        )) AS INT64) AS flow_key,
+        
+        date_key,
+        time_key,
+        flow_timestamp,
+        
+        -- Degenerate Dimensions
+        station_id,
+        district,
+        route,
+        direction,
+        lane_type,
+        
+        -- Cột đánh giá chất lượng dữ liệu cực hay từ Cách 1
+        CASE
+            WHEN total_flow > 3000 THEN 'OUTLIER_FLOW'
+            WHEN avg_occupancy > 0.90 THEN 'OUTLIER_OCCUPANCY'
+            WHEN avg_speed > 80 THEN 'OUTLIER_SPEED'
+            WHEN total_flow > 0 AND avg_speed = 0 THEN 'CHECK_CONGESTION_OR_SENSOR'
+            WHEN avg_occupancy > 0 AND total_flow = 0 AND avg_speed = 0 THEN 'POSSIBLE_SENSOR_FAILURE'
+            ELSE 'VALID'
+        END AS data_quality_flag,
+
+        -- Measures
+        station_length,
+        samples,
+        percent_observed,
+        total_flow,
+        avg_occupancy,
+        avg_speed,
+
+        -- Delay Measures
+        delay_35, delay_40, delay_45, delay_50, delay_55, delay_60,
+
+        -- Lane Measures (Đầy đủ 8 làn từ lớp Silver)
+        lane_1_flow, lane_1_avg_occ, lane_1_avg_speed,
+        lane_2_flow, lane_2_avg_occ, lane_2_avg_speed,
+        lane_3_flow, lane_3_avg_occ, lane_3_avg_speed,
+        lane_4_flow, lane_4_avg_occ, lane_4_avg_speed,
+        lane_5_flow, lane_5_avg_occ, lane_5_avg_speed,
+        lane_6_flow, lane_6_avg_occ, lane_6_avg_speed,
+        lane_7_flow, lane_7_avg_occ, lane_7_avg_speed,
+        lane_8_flow, lane_8_avg_occ, lane_8_avg_speed
+
+    FROM map_time
+),
+
+--------------------------------------------------------------------------------
+-- Stage 4 : Deduplication
+--------------------------------------------------------------------------------
+deduplicated AS (
+    SELECT *
+    FROM fact_base
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY station_id, flow_timestamp, direction, lane_type
+        ORDER BY flow_timestamp DESC
+    ) = 1
+)
+
+SELECT * FROM deduplicated

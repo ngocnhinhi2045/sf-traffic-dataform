@@ -1,0 +1,65 @@
+config {
+    type: "table",
+    schema: "sf_traffic_mart",
+    name: "mart_traffic_safety",
+    description: "Traffic Safety Mart: Phân tích an toàn giao thông, điểm đen tai nạn và môi trường",
+    tags: ["mart", "safety", "accident"],
+    bigquery: {
+        partitionBy: "DATE(collision_datetime)",
+        clusterBy: ["severity_level", "neighborhood_name", "weather_condition"]
+    }
+}
+
+WITH crash_data AS (
+    SELECT 
+        c.unique_id, c.collision_datetime, c.location_key, c.police_station_key,
+        c.environment_key, c.neighborhood_key, c.date_key, c.time_key,
+        c.type_of_collision, c.pcf_description, c.party_at_fault,
+        c.number_killed, c.number_injured, c.geography
+    FROM ${ref("fact_traffic_crash")} c
+)
+
+SELECT
+    c.unique_id AS crash_id,
+    c.collision_datetime,
+    d.full_date AS crash_date,
+    t.hour_name AS crash_time,
+    
+    -- Phân loại mức độ nghiêm trọng (Áp dụng đúng góp ý để vẽ Dashboard)
+    CASE 
+        WHEN c.number_killed >= 1 THEN 'Fatal'
+        WHEN c.number_injured >= 3 THEN 'Major'
+        WHEN c.number_injured >= 1 THEN 'Minor'
+        ELSE 'PDO' -- Property Damage Only (Chỉ thiệt hại tài sản)
+    END AS severity_level,
+    
+    c.number_killed,
+    c.number_injured,
+    c.type_of_collision,
+    c.pcf_description AS primary_collision_factor,
+    c.party_at_fault,
+    
+    -- Yếu tố môi trường
+    e.weather_condition_1 AS weather_condition,
+    e.lighting,
+    e.road_surface,
+    e.road_condition_1,
+    
+    -- Địa điểm
+    l.street_name,
+    n.neighborhood_name,
+    
+    -- Điều phối (Dispatch)
+    p.station_name AS dispatch_police_station,
+    p.phone AS dispatch_phone,
+
+    c.geography
+
+
+FROM crash_data c
+LEFT JOIN ${ref("dim_date")} d ON c.date_key = d.date_key
+LEFT JOIN ${ref("dim_time")} t ON c.time_key = t.time_key
+LEFT JOIN ${ref("dim_location_street")} l ON c.location_key = l.location_key
+LEFT JOIN ${ref("dim_neighborhood")} n ON c.neighborhood_key = n.neighborhood_key
+LEFT JOIN ${ref("dim_environment")} e ON c.environment_key = e.environment_key
+LEFT JOIN ${ref("dim_police_station")} p ON c.police_station_key = p.police_station_key

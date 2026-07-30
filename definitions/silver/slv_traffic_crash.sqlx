@@ -1,0 +1,181 @@
+config {
+    type: "table",
+    schema: "sf_traffic_silver",
+    name: "slv_traffic_crash",
+    description: "Silver layer - Standardized traffic crash dataset (CSV Source)",
+    tags: ["silver", "traffic_crash", "fact"],
+    columns: {
+        unique_id: "Unique crash record identifier",
+        collision_datetime: "Collision timestamp",
+        latitude: "Numeric latitude (WGS84)",
+        longitude: "Numeric longitude (WGS84)",
+        geography: "Crash location"
+    },
+    assertions: {
+        nonNull: ["unique_id", "collision_datetime", "geography"],
+        uniqueKey: ["unique_id"]
+    },
+    bigquery: {
+        partitionBy: "DATE(collision_datetime)",
+        clusterBy: ["analysis_neighborhood", "collision_severity", "type_of_collision"]
+    }
+}
+
+--------------------------------------------------------------------------------
+-- Stage 1 : Source
+--------------------------------------------------------------------------------
+WITH source AS (
+    SELECT *
+    FROM ${ref("raw_traffic_crash")}
+),
+
+--------------------------------------------------------------------------------
+-- Stage 2 : Schema Standardization (Đọc chính xác tên cột từ Cách 1 của bạn)
+--------------------------------------------------------------------------------
+standardized AS (
+    SELECT
+        -- 1. Mã định danh 
+        SAFE_CAST(TRIM(CAST(unique_id AS STRING)) AS INT64)         AS unique_id,
+        SAFE_CAST(TRIM(CAST(case_id_pkey AS STRING)) AS INT64)      AS case_id,
+        SAFE_CAST(TRIM(CAST(cnn_intrsctn_fkey AS STRING)) AS INT64) AS cnn_intersection,
+        SAFE_CAST(TRIM(CAST(cnn_sgmt_fkey AS STRING)) AS INT64)     AS cnn_segment,
+        TRIM(CAST(officer_id AS STRING))                            AS officer_id,
+
+        -- 2. Thời gian
+        SAFE_CAST(TRIM(CAST(collision_datetime AS STRING)) AS TIMESTAMP) AS collision_datetime,
+
+        -- 3. Thông tin địa điểm & Phân vùng (Rename nhẹ cho chuẩn)
+        TRIM(CAST(juris AS STRING))                                 AS juris,
+        TRIM(CAST(police_district AS STRING))                       AS police_district,
+        TRIM(CAST(reporting_district AS STRING))                    AS reporting_district,
+        TRIM(CAST(beat_number AS STRING))                           AS beat_number,
+        TRIM(CAST(primary_rd AS STRING))                            AS primary_road,
+        TRIM(CAST(secondary_rd AS STRING))                          AS secondary_road,
+        SAFE_CAST(TRIM(CAST(distance AS STRING)) AS FLOAT64)        AS distance,
+        TRIM(CAST(direction AS STRING))                             AS direction,
+        TRIM(CAST(intersection AS STRING))                          AS intersection,
+        TRIM(CAST(analysis_neighborhood AS STRING))                 AS analysis_neighborhood,
+        SAFE_CAST(TRIM(CAST(supervisor_district AS STRING)) AS INT64) AS supervisor_district,
+
+        -- 4. Điều kiện môi trường
+        TRIM(CAST(weather_1 AS STRING))                             AS weather_1,
+        TRIM(CAST(weather_2 AS STRING))                             AS weather_2,
+        TRIM(CAST(road_surface AS STRING))                          AS road_surface,
+        TRIM(CAST(road_cond_1 AS STRING))                           AS road_condition_1,
+        TRIM(CAST(road_cond_2 AS STRING))                           AS road_condition_2,
+        TRIM(CAST(lighting AS STRING))                              AS lighting,
+        TRIM(CAST(control_device AS STRING))                        AS control_device,
+
+        -- 5. Thông tin Vi phạm & Phân loại sự cố (Lấy tên cột chuẩn)
+        TRIM(CAST(collision_severity AS STRING))                    AS collision_severity,
+        TRIM(CAST(type_of_collision AS STRING))                     AS type_of_collision,
+        TRIM(CAST(mviw AS STRING))                                  AS mviw,
+        TRIM(CAST(ped_action AS STRING))                            AS ped_action,
+        TRIM(CAST(vz_pcf_code AS STRING))                           AS pcf_code,
+        TRIM(CAST(vz_pcf_group AS STRING))                          AS pcf_group,
+        TRIM(CAST(vz_pcf_description AS STRING))                    AS pcf_description,
+        TRIM(CAST(dph_col_grp AS STRING))                           AS dph_collision_group,
+
+        -- 6. Số liệu Thương vong
+        SAFE_CAST(TRIM(CAST(number_killed AS STRING)) AS INT64)     AS number_killed,
+        SAFE_CAST(TRIM(CAST(number_injured AS STRING)) AS INT64)    AS number_injured,
+
+        -- 7. Thông tin các bên liên quan (party1, party2 theo đúng file của bạn)
+        TRIM(CAST(party_at_fault AS STRING))                        AS party_at_fault,
+        TRIM(CAST(party1_type AS STRING))                           AS party1_type,
+        TRIM(CAST(party1_dir_of_travel AS STRING))                  AS party1_dir_of_travel,
+        TRIM(CAST(party1_move_pre_acc AS STRING))                   AS party1_move_pre_acc,
+        TRIM(CAST(party2_type AS STRING))                           AS party2_type,
+        TRIM(CAST(party2_dir_of_travel AS STRING))                  AS party2_dir_of_travel,
+        TRIM(CAST(party2_move_pre_acc AS STRING))                   AS party2_move_pre_acc,
+
+        -- 8. Tọa độ (Đọc từ tb_latitude / tb_longitude)
+        SAFE_CAST(TRIM(CAST(tb_latitude AS STRING)) AS FLOAT64)     AS latitude,
+        SAFE_CAST(TRIM(CAST(tb_longitude AS STRING)) AS FLOAT64)    AS longitude
+
+    FROM source
+),
+
+--------------------------------------------------------------------------------
+-- Stage 3 : Data Cleansing
+--------------------------------------------------------------------------------
+cleaned AS (
+    SELECT *
+    FROM standardized
+    WHERE
+        unique_id IS NOT NULL
+        
+        -- BỔ SUNG BỘ LỌC SAN FRANCISCO:
+        AND (
+            juris = '3801' -- Mã Jurisdiction chuẩn của San Francisco
+            OR reporting_district IS NOT NULL
+            OR beat_number IS NOT NULL
+            OR analysis_neighborhood IS NOT NULL
+        )
+),
+--------------------------------------------------------------------------------
+-- Stage 4 : Data Transformation
+--------------------------------------------------------------------------------
+transformed AS (
+    SELECT
+        *,
+        ST_GEOGPOINT(longitude, latitude) AS geography
+    FROM cleaned
+),
+
+--------------------------------------------------------------------------------
+-- Stage 5 : Data Quality Validation
+--------------------------------------------------------------------------------
+validated AS (
+    SELECT *
+    FROM transformed
+    WHERE
+        latitude BETWEEN -90 AND 90
+        AND longitude BETWEEN -180 AND 180
+        AND geography IS NOT NULL
+        AND (number_killed IS NULL OR number_killed >= 0)
+        AND (number_injured IS NULL OR number_injured >= 0)
+),
+
+--------------------------------------------------------------------------------
+-- Stage 6 : Deduplication
+--------------------------------------------------------------------------------
+deduplicated AS (
+    SELECT *
+    FROM validated
+    -- File CSV của bạn dùng cách cast unique_id sang string ở stage deduplicate, 
+    -- nhưng unique_id ở đây đã được ép về INT64 an toàn nên chạy cực chuẩn.
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY unique_id
+        ORDER BY collision_datetime DESC
+    ) = 1
+),
+
+--------------------------------------------------------------------------------
+-- Stage 7 : Publish
+--------------------------------------------------------------------------------
+final AS (
+    SELECT 
+        unique_id, case_id, cnn_intersection, cnn_segment, officer_id,
+        collision_datetime,
+        juris, police_district, reporting_district, beat_number,
+        primary_road, secondary_road, distance, direction, intersection,
+        analysis_neighborhood, supervisor_district,
+        weather_1, weather_2, road_surface, road_condition_1, road_condition_2,
+        lighting, control_device,
+        collision_severity, type_of_collision, mviw, ped_action,
+        pcf_code, pcf_group, pcf_description, dph_collision_group,
+        number_killed, number_injured,
+        party_at_fault, party1_type, party1_dir_of_travel, party1_move_pre_acc,
+        party2_type, party2_dir_of_travel, party2_move_pre_acc,
+        latitude, longitude, geography,
+        
+        -- Audit metadata
+        CURRENT_TIMESTAMP() AS _etl_loaded_at,
+        "raw_traffic_crash_csv" AS _source_system,
+        "Silver" AS _layer,
+        "1.1" AS _pipeline_version
+    FROM deduplicated
+)
+
+SELECT * FROM final

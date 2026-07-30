@@ -1,0 +1,118 @@
+config {
+    type: "table",
+    schema: "sf_traffic_silver",
+    name: "slv_police_station",
+    description: "Silver layer - Standardized police station dataset (Named Columns)",
+    tags: ["silver", "dimension"],
+    columns: {
+        station_code: "Police station code (Mapped from district_name)",
+        station_name: "Police station name (Mapped from company_name)",
+        address: "Police station address",
+        phone: "Police station phone number",
+        geography: "Police station location (WGS84)"
+    },
+    assertions: {
+        nonNull: ["station_code", "station_name", "geography"],
+        uniqueKey: ["station_code"]
+    },
+    bigquery: {
+        clusterBy: ["station_name"]
+    }
+}
+
+--------------------------------------------------------------------------------
+-- Stage 1 : Source
+--------------------------------------------------------------------------------
+WITH source AS (
+    -- Giữ nguyên reference theo cấu trúc của bạn
+    SELECT *
+    FROM ${ref("sf_traffic_bronze", "ext_police_station")}
+),
+
+--------------------------------------------------------------------------------
+-- Stage 2 : Schema Standardization (Đổi tên cột để đồng bộ với Cách 2)
+--------------------------------------------------------------------------------
+standardized AS (
+    SELECT
+        -- Đổi tên cột cho khớp Output Schema
+        TRIM(CAST(district_name AS STRING))      AS station_code,
+        TRIM(CAST(company_name AS STRING))       AS station_name,
+        TRIM(CAST(address AS STRING))            AS address,
+        TRIM(CAST(telephone_number AS STRING))   AS phone,
+        
+        -- Dùng Regex tinh chỉnh từ Cách 2 (hỗ trợ cả số nguyên lẫn số thập phân)
+        SAFE_CAST(REGEXP_EXTRACT(CAST(location AS STRING), r'\((-?\d+\.?\d*),') AS FLOAT64) AS latitude,
+        SAFE_CAST(REGEXP_EXTRACT(CAST(location AS STRING), r',\s*(-?\d+\.?\d*)\)') AS FLOAT64) AS longitude
+    FROM source
+),
+
+--------------------------------------------------------------------------------
+-- Stage 3 : Data Cleansing
+--------------------------------------------------------------------------------
+cleaned AS (
+    SELECT *
+    FROM standardized
+    WHERE
+        station_code IS NOT NULL
+        AND station_name IS NOT NULL
+),
+
+--------------------------------------------------------------------------------
+-- Stage 4 : Data Transformation
+--------------------------------------------------------------------------------
+transformed AS (
+    SELECT
+        station_code,
+        station_name,
+        address,
+        phone,
+        latitude,
+        longitude,
+        ST_GEOGPOINT(longitude, latitude) AS geography
+    FROM cleaned
+),
+
+--------------------------------------------------------------------------------
+-- Stage 5 : Data Quality Validation (Bảo vệ lỗi tọa độ)
+--------------------------------------------------------------------------------
+validated AS (
+    SELECT *
+    FROM transformed
+    WHERE
+        latitude BETWEEN -90 AND 90
+        AND longitude BETWEEN -180 AND 180
+        AND geography IS NOT NULL
+),
+
+--------------------------------------------------------------------------------
+-- Stage 6 : Deduplication
+--------------------------------------------------------------------------------
+deduplicated AS (
+    SELECT *
+    FROM validated
+    -- Sử dụng logic xóa trùng lặp an toàn bằng mã code (hoặc tên trạm)
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY station_code 
+        ORDER BY station_name, address
+    ) = 1
+),
+
+--------------------------------------------------------------------------------
+-- Stage 7 : Publish (Gắn Audit Columns)
+--------------------------------------------------------------------------------
+final AS (
+    SELECT
+        station_code,
+        station_name,
+        address,
+        phone,
+        geography,
+        
+        CURRENT_TIMESTAMP() AS _etl_loaded_at,
+        "ext_police_station_csv" AS _source_system,
+        "Silver" AS _layer,
+        "1.1" AS _pipeline_version
+    FROM deduplicated
+)
+
+SELECT * FROM final

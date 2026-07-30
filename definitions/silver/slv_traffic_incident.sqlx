@@ -1,0 +1,126 @@
+config {
+    type: "table",
+    schema: "sf_traffic_silver",
+    name: "slv_traffic_incident",
+    description: "Silver layer - Standardized traffic incident dataset (Optimized Struct/Array)",
+    tags: ["silver", "incident", "fact"],
+    columns: {
+        incident_id: "Unique incident identifier",
+        updated: "Last updated timestamp",
+        geography: "Incident location (Point)"
+    },
+    assertions: {
+        nonNull: ["incident_id", "updated", "geography"],
+        uniqueKey: ["incident_id"]
+    },
+    bigquery: {
+        partitionBy: "DATE(updated)",
+        clusterBy: ["event_type", "severity", "status"]
+    }
+}
+
+--------------------------------------------------------------------------------
+-- Stage 1 : Source
+--------------------------------------------------------------------------------
+WITH source AS (
+    SELECT *
+    FROM ${ref("raw_traffic_incident")}
+),
+
+--------------------------------------------------------------------------------
+-- Stage 2 : Schema Standardization 
+--------------------------------------------------------------------------------
+standardized AS (
+    SELECT
+        -- 1. Các định danh cơ bản 
+        TRIM(CAST(id AS STRING)) AS incident_id,
+        TRIM(CAST(source_id AS STRING)) AS source_id,
+        TRIM(CAST(source_type AS STRING)) AS source_type,
+        TRIM(CAST(event_type AS STRING)) AS event_type,
+        ARRAY_TO_STRING(event_subtypes, ', ') AS event_subtypes,
+        TRIM(CAST(status AS STRING)) AS status,
+        TRIM(CAST(severity AS STRING)) AS severity,
+        TRIM(CAST(headline AS STRING)) AS headline,
+        
+        -- 2. Lịch trình và Thời gian ghi nhận
+        ARRAY_TO_STRING(schedule.intervals, ', ') AS schedule_interval,
+        SAFE_CAST(created AS TIMESTAMP) AS created_at,
+        SAFE_CAST(updated AS TIMESTAMP) AS updated,
+        
+        -- 3. Khu vực và Đường phố (Đã bọc ngoặc ngược cho `from` và `to`)
+        ARRAY_TO_STRING(ARRAY(SELECT TRIM(CAST(id AS STRING)) FROM UNNEST(areas)), ', ') AS areas_id,
+        ARRAY_TO_STRING(ARRAY(SELECT TRIM(CAST(name AS STRING)) FROM UNNEST(areas)), ', ') AS areas_name,
+        
+        ARRAY_TO_STRING(ARRAY(SELECT TRIM(CAST(name AS STRING)) FROM UNNEST(roads)), ', ') AS roads_name,
+        ARRAY_TO_STRING(ARRAY(SELECT TRIM(CAST(direction AS STRING)) FROM UNNEST(roads)), ', ') AS roads_direction,
+        ARRAY_TO_STRING(ARRAY(SELECT TRIM(CAST(state AS STRING)) FROM UNNEST(roads)), ', ') AS roads_state,
+        ARRAY_TO_STRING(ARRAY(SELECT TRIM(CAST(lane_status AS STRING)) FROM UNNEST(roads)), ', ') AS roads_lane_status,
+        ARRAY_TO_STRING(ARRAY(SELECT TRIM(CAST(road_advisory AS STRING)) FROM UNNEST(roads)), ', ') AS roads_road_advisory,
+        ARRAY_TO_STRING(ARRAY(SELECT TRIM(CAST(`from` AS STRING)) FROM UNNEST(roads)), ', ') AS roads_from,
+        ARRAY_TO_STRING(ARRAY(SELECT TRIM(CAST(`to` AS STRING)) FROM UNNEST(roads)), ', ') AS roads_to,
+        ARRAY_TO_STRING(ARRAY(SELECT TRIM(CAST(lane_type AS STRING)) FROM UNNEST(roads)), ', ') AS roads_lane_type,
+        ARRAY_TO_STRING(ARRAY(SELECT TRIM(CAST(article AS STRING)) FROM UNNEST(roads)), ', ') AS roads_article,
+        
+        -- 4. Không gian
+        ST_GEOGPOINT(
+            CAST(geography.coordinates[SAFE_OFFSET(0)] AS FLOAT64),
+            CAST(geography.coordinates[SAFE_OFFSET(1)] AS FLOAT64)
+        ) AS geography
+
+    FROM source
+),
+
+--------------------------------------------------------------------------------
+-- Stage 3 : Cleansing
+--------------------------------------------------------------------------------
+cleaned AS (
+    SELECT *
+    FROM standardized
+    WHERE incident_id IS NOT NULL
+        
+        -- BỔ SUNG BỘ LỌC SAN FRANCISCO:
+        AND UPPER(areas_name) LIKE '%SAN FRANCISCO%'
+),
+
+--------------------------------------------------------------------------------
+-- Stage 4 : Validation
+--------------------------------------------------------------------------------
+validated AS (
+    SELECT *
+    FROM cleaned
+    WHERE geography IS NOT NULL
+),
+
+--------------------------------------------------------------------------------
+-- Stage 5 : Deduplication
+--------------------------------------------------------------------------------
+deduplicated AS (
+    SELECT *
+    FROM validated
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY incident_id 
+        ORDER BY updated DESC
+    ) = 1
+),
+
+--------------------------------------------------------------------------------
+-- Stage 6 : Publish 
+--------------------------------------------------------------------------------
+final AS (
+    SELECT
+        incident_id, source_id, source_type, event_type, event_subtypes,
+        status, severity, headline, schedule_interval, 
+        created_at, updated,
+        areas_id, areas_name,
+        roads_name, roads_direction, roads_state, roads_lane_status,
+        roads_road_advisory, roads_from, roads_to, roads_lane_type, roads_article,
+        geography,
+        
+        CURRENT_TIMESTAMP() AS _etl_loaded_at,
+        "raw_traffic_incident" AS _source_system,
+        "Silver" AS _layer,
+        "1.1" AS _pipeline_version
+    FROM deduplicated
+)
+
+SELECT * FROM final

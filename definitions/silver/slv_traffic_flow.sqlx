@@ -1,0 +1,176 @@
+config {
+    type: "table",
+    schema: "sf_traffic_silver",
+    name: "slv_traffic_flow",
+    description: "Silver layer - Standardized traffic flow dataset (Optimized CSV Source)",
+    tags: ["silver", "traffic_flow", "fact"],
+    columns: {
+        station_id: "Traffic station identifier",
+        flow_timestamp: "Observation timestamp",
+        route: "Highway route",
+        district: "Caltrans district"
+    },
+    assertions: {
+        nonNull: ["station_id", "flow_timestamp"],
+        uniqueKey: ["station_id", "flow_timestamp"]
+    },
+    bigquery: {
+        partitionBy: "DATE(flow_timestamp)",
+        clusterBy: ["district", "route", "direction"]
+    }
+}
+
+--------------------------------------------------------------------------------
+-- Stage 1 : Source
+--------------------------------------------------------------------------------
+WITH source AS (
+    SELECT *
+    FROM ${ref("ext_traffic_flow")}
+),
+
+--------------------------------------------------------------------------------
+-- Stage 2 : Schema Standardization (Lấy trọn vẹn logic Cách 1)
+--------------------------------------------------------------------------------
+standardized AS (
+    SELECT
+        -- 1. Định danh trạm
+        SAFE_CAST(TRIM(CAST(Station AS STRING)) AS INT64)      AS station_id,
+        SAFE_CAST(TRIM(CAST(District AS STRING)) AS INT64)     AS district,
+        TRIM(CAST(Route AS STRING))                            AS route,
+        TRIM(CAST(Direction AS STRING))                        AS direction,
+        
+        -- Chuẩn hóa cột Lane_Type dựa trên Metadata
+        CASE UPPER(TRIM(CAST(Lane_Type AS STRING)))
+            WHEN 'CD' THEN 'Coll/Dist'
+            WHEN 'CH' THEN 'Conventional Highway'
+            WHEN 'FF' THEN 'Fwy-Fwy connector'
+            WHEN 'FR' THEN 'Off Ramp'
+            WHEN 'HV' THEN 'HOV'
+            WHEN 'ML' THEN 'Mainline'
+            WHEN 'OR' THEN 'On Ramp'
+            ELSE TRIM(CAST(Lane_Type AS STRING))
+        END AS lane_type,
+
+        -- 2. Xử lý thời gian (Logic xuất sắc từ Cách 1)
+        COALESCE(
+            SAFE_CAST(TRIM(CAST(Timestamp AS STRING)) AS TIMESTAMP),
+            SAFE.PARSE_TIMESTAMP('%m/%d/%Y %H:%M:%S', TRIM(CAST(Timestamp AS STRING)))
+        ) AS flow_timestamp,
+
+        -- 3. Các chỉ số đo lường
+        SAFE_CAST(TRIM(CAST(Station_Length AS STRING)) AS FLOAT64)   AS station_length,
+        SAFE_CAST(TRIM(CAST(Samples AS STRING)) AS INT64)            AS samples,
+        SAFE_CAST(TRIM(CAST(Percent_Observed AS STRING)) AS FLOAT64) AS percent_observed,
+        SAFE_CAST(TRIM(CAST(Total_Flow AS STRING)) AS FLOAT64)       AS total_flow,
+        SAFE_CAST(TRIM(CAST(Avg_Occupancy AS STRING)) AS FLOAT64)    AS avg_occupancy,
+        SAFE_CAST(TRIM(CAST(Avg_Speed AS STRING)) AS FLOAT64)        AS avg_speed,
+
+        -- 4. Chỉ số theo các mức Delay
+        SAFE_CAST(TRIM(CAST(Delay_35 AS STRING)) AS FLOAT64) AS delay_35,
+        SAFE_CAST(TRIM(CAST(Delay_40 AS STRING)) AS FLOAT64) AS delay_40,
+        SAFE_CAST(TRIM(CAST(Delay_45 AS STRING)) AS FLOAT64) AS delay_45,
+        SAFE_CAST(TRIM(CAST(Delay_50 AS STRING)) AS FLOAT64) AS delay_50,
+        SAFE_CAST(TRIM(CAST(Delay_55 AS STRING)) AS FLOAT64) AS delay_55,
+        SAFE_CAST(TRIM(CAST(Delay_60 AS STRING)) AS FLOAT64) AS delay_60,
+
+        -- 5. Chỉ số chi tiết từng làn (FULL 8 Làn)
+        SAFE_CAST(TRIM(CAST(Lane_1_Flow AS STRING)) AS FLOAT64) AS lane_1_flow,
+        SAFE_CAST(TRIM(CAST(Lane_1_Avg_Occ AS STRING)) AS FLOAT64) AS lane_1_avg_occ,
+        SAFE_CAST(TRIM(CAST(Lane_1_Avg_Speed AS STRING)) AS FLOAT64) AS lane_1_avg_speed,
+        
+        SAFE_CAST(TRIM(CAST(Lane_2_Flow AS STRING)) AS FLOAT64) AS lane_2_flow,
+        SAFE_CAST(TRIM(CAST(Lane_2_Avg_Occ AS STRING)) AS FLOAT64) AS lane_2_avg_occ,
+        SAFE_CAST(TRIM(CAST(Lane_2_Avg_Speed AS STRING)) AS FLOAT64) AS lane_2_avg_speed,
+        
+        SAFE_CAST(TRIM(CAST(Lane_3_Flow AS STRING)) AS FLOAT64) AS lane_3_flow,
+        SAFE_CAST(TRIM(CAST(Lane_3_Avg_Occ AS STRING)) AS FLOAT64) AS lane_3_avg_occ,
+        SAFE_CAST(TRIM(CAST(Lane_3_Avg_Speed AS STRING)) AS FLOAT64) AS lane_3_avg_speed,
+        
+        SAFE_CAST(TRIM(CAST(Lane_4_Flow AS STRING)) AS FLOAT64) AS lane_4_flow,
+        SAFE_CAST(TRIM(CAST(Lane_4_Avg_Occ AS STRING)) AS FLOAT64) AS lane_4_avg_occ,
+        SAFE_CAST(TRIM(CAST(Lane_4_Avg_Speed AS STRING)) AS FLOAT64) AS lane_4_avg_speed,
+        
+        SAFE_CAST(TRIM(CAST(Lane_5_Flow AS STRING)) AS FLOAT64) AS lane_5_flow,
+        SAFE_CAST(TRIM(CAST(Lane_5_Avg_Occ AS STRING)) AS FLOAT64) AS lane_5_avg_occ,
+        SAFE_CAST(TRIM(CAST(Lane_5_Avg_Speed AS STRING)) AS FLOAT64) AS lane_5_avg_speed,
+        
+        SAFE_CAST(TRIM(CAST(Lane_6_Flow AS STRING)) AS FLOAT64) AS lane_6_flow,
+        SAFE_CAST(TRIM(CAST(Lane_6_Avg_Occ AS STRING)) AS FLOAT64) AS lane_6_avg_occ,
+        SAFE_CAST(TRIM(CAST(Lane_6_Avg_Speed AS STRING)) AS FLOAT64) AS lane_6_avg_speed,
+        
+        SAFE_CAST(TRIM(CAST(Lane_7_Flow AS STRING)) AS FLOAT64) AS lane_7_flow,
+        SAFE_CAST(TRIM(CAST(Lane_7_Avg_Occ AS STRING)) AS FLOAT64) AS lane_7_avg_occ,
+        SAFE_CAST(TRIM(CAST(Lane_7_Avg_Speed AS STRING)) AS FLOAT64) AS lane_7_avg_speed,
+        
+        SAFE_CAST(TRIM(CAST(Lane_8_Flow AS STRING)) AS FLOAT64) AS lane_8_flow,
+        SAFE_CAST(TRIM(CAST(Lane_8_Avg_Occ AS STRING)) AS FLOAT64) AS lane_8_avg_occ,
+        SAFE_CAST(TRIM(CAST(Lane_8_Avg_Speed AS STRING)) AS FLOAT64) AS lane_8_avg_speed
+
+    FROM source
+),
+
+--------------------------------------------------------------------------------
+-- Stage 3 : Data Cleansing
+--------------------------------------------------------------------------------
+cleaned AS (
+    SELECT 
+        s.* 
+    FROM standardized s
+    JOIN ${ref("slv_station_metadata")} meta
+        ON s.station_id = meta.station_id
+    WHERE 
+        s.station_id IS NOT NULL
+        AND s.flow_timestamp IS NOT NULL
+        
+        -- MÃ FIPS CỦA QUẬN SAN FRANCISCO LÀ 75
+        AND meta.county_identifier = 75 
+),
+
+--------------------------------------------------------------------------------
+-- Stage 4 : Data Transformation
+--------------------------------------------------------------------------------
+transformed AS (
+    SELECT *
+    FROM cleaned
+),
+
+--------------------------------------------------------------------------------
+-- Stage 5 : Data Quality Validation
+--------------------------------------------------------------------------------
+validated AS (
+    SELECT *
+    FROM transformed
+    WHERE
+        -- Kết hợp điều kiện lọc giá trị vật lý của Cách 1 và thêm IS NULL của Cách 2
+        (total_flow IS NULL OR total_flow >= 0)
+        AND (avg_speed IS NULL OR avg_speed >= 0)
+        AND (avg_occupancy IS NULL OR avg_occupancy >= 0)
+        AND (percent_observed IS NULL OR percent_observed BETWEEN 0 AND 100)
+),
+
+--------------------------------------------------------------------------------
+-- Stage 6 : Deduplication
+--------------------------------------------------------------------------------
+deduplicated AS (
+    SELECT *
+    FROM validated
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY station_id, flow_timestamp
+        ORDER BY flow_timestamp DESC
+    ) = 1
+),
+
+--------------------------------------------------------------------------------
+-- Stage 7 : Publish
+--------------------------------------------------------------------------------
+final AS (
+    SELECT 
+        *,
+        CURRENT_TIMESTAMP() AS _etl_loaded_at,
+        "ext_traffic_flow_csv" AS _source_system,
+        "Silver" AS _layer,
+        "1.1" AS _pipeline_version
+    FROM deduplicated
+)
+
+SELECT * FROM final

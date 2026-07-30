@@ -1,0 +1,51 @@
+config {
+    type: "table",
+    schema: "sf_traffic_gold",
+    name: "dim_camera",
+    description: "Camera Dimension",
+    tags: ["gold", "dimension"],
+    assertions: {
+        uniqueKey: ["camera_key"],
+        nonNull: ["camera_key", "camera_id"]
+    }
+}
+
+WITH source AS (
+    SELECT *
+    FROM ${ref("slv_camera")}
+),
+cleaned AS (
+    SELECT 
+        camera_id,
+        district,
+        county,
+        route,
+        route_suffix,
+        direction,
+        location_name,
+        nearby_place,
+        elevation,
+        postmile_prefix,
+        postmile,
+        alignment,
+        milepost,
+        longitude,
+        latitude,
+        IFNULL(in_service, FALSE) AS in_service,
+        streaming_video_url,
+        current_image_url,
+        geography
+    FROM source
+    WHERE camera_id IS NOT NULL
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY camera_id 
+        ORDER BY location_name
+    ) = 1
+),
+final AS (
+    SELECT
+        ROW_NUMBER() OVER(ORDER BY camera_id) AS camera_key,
+        *
+    FROM cleaned
+)
+SELECT * FROM final

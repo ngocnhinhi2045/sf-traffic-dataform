@@ -1,0 +1,50 @@
+config {
+    type: "table",
+    schema: "sf_traffic_gold",
+    name: "dim_environment",
+    description: "Environment Dimension (Junk Dimension for Crash conditions)",
+    tags: ["gold", "dimension"],
+    assertions: {
+        uniqueKey: ["environment_key"],
+        nonNull: ["environment_key"]
+    }
+}
+
+WITH source AS (
+    SELECT
+        weather_1,
+        weather_2,
+        lighting,
+        road_surface,
+        road_condition_1,
+        road_condition_2,
+        control_device
+    FROM ${ref("slv_traffic_crash")}
+),
+cleaned AS (
+    SELECT DISTINCT
+        IFNULL(TRIM(weather_1), "Unknown") AS weather_condition_1,
+        IFNULL(TRIM(weather_2), "Unknown") AS weather_condition_2,
+        IFNULL(TRIM(lighting), "Unknown") AS lighting,
+        IFNULL(TRIM(road_surface), "Unknown") AS road_surface,
+        IFNULL(TRIM(road_condition_1), "Unknown") AS road_condition_1,
+        IFNULL(TRIM(road_condition_2), "Unknown") AS road_condition_2,
+        IFNULL(TRIM(control_device), "Unknown") AS control_device
+    FROM source
+),
+final AS (
+    SELECT
+        ROW_NUMBER() OVER(
+            ORDER BY 
+                weather_condition_1, 
+                weather_condition_2, 
+                lighting, 
+                road_surface, 
+                road_condition_1, 
+                road_condition_2,
+                control_device
+        ) AS environment_key,
+        *
+    FROM cleaned
+)
+SELECT * FROM final

@@ -1,0 +1,199 @@
+config {
+    type: "table",
+    schema: "sf_traffic_gold",
+    name: "fact_traffic_crash",
+    description: "Fact Table - Traffic Crashes (Ánh xạ chuẩn Star Schema)",
+    tags: ["gold", "fact"],
+    bigquery: {
+        partitionBy: "DATE(collision_datetime)",
+        clusterBy: [
+            "collision_severity", 
+            "location_key", 
+            "neighborhood_key"
+        ]
+    }
+}
+
+WITH 
+--------------------------------------------------------------------------------
+-- Stage 1 : Source
+--------------------------------------------------------------------------------
+source AS (
+    SELECT *
+    FROM ${ref("slv_traffic_crash")}
+    WHERE unique_id IS NOT NULL 
+      AND collision_datetime IS NOT NULL
+),
+
+--------------------------------------------------------------------------------
+-- Stage 2 : Lookup Date & Time Dimensions
+--------------------------------------------------------------------------------
+map_date AS (
+    SELECT 
+        s.*, 
+        d.date_key
+    FROM source s
+    LEFT JOIN ${ref("dim_date")} d 
+        ON DATE(s.collision_datetime) = d.full_date
+),
+
+map_time AS (
+    SELECT 
+        d.*, 
+        t.time_key
+    FROM map_date d
+    LEFT JOIN ${ref("dim_time")} t 
+        -- Đưa thời gian về mức phút (bỏ qua giây) để khớp với dim_time
+        ON TIME_TRUNC(TIME(d.collision_datetime), MINUTE) = t.full_time
+),
+
+--------------------------------------------------------------------------------
+-- Stage 3 : Spatial & Network Mapping 
+--------------------------------------------------------------------------------
+map_location AS (
+    SELECT 
+        c.unique_id, 
+        loc.location_key
+    FROM map_time c
+    JOIN ${ref("dim_location_street")} loc
+        ON ST_DWithin(c.geography, loc.geography, 100) 
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY c.unique_id 
+        ORDER BY 
+            -- TRỌNG SỐ 1: Quét xem tên đường (street_name) có nằm trong cột primary_road hoặc intersection của tai nạn không
+            CASE 
+                WHEN STRPOS(UPPER(TRIM(c.primary_road)), UPPER(TRIM(loc.street_name))) > 0 THEN 0
+                WHEN STRPOS(UPPER(TRIM(c.intersection)), UPPER(TRIM(loc.street_name))) > 0 THEN 0
+                ELSE 1 
+            END ASC,
+            -- TRỌNG SỐ 2: Lấy khoảng cách gần nhất
+            ST_Distance(c.geography, loc.geography) ASC
+    ) = 1
+),
+
+map_camera AS (
+    SELECT 
+        c.unique_id, 
+        cam.camera_key
+    FROM map_time c
+    JOIN ${ref("dim_camera")} cam
+        ON ST_DWithin(c.geography, cam.geography, 500) 
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY c.unique_id ORDER BY ST_Distance(c.geography, cam.geography) ASC) = 1
+),
+
+map_police AS (
+    SELECT 
+        c.unique_id, 
+        ps.police_station_key
+    FROM map_time c
+    CROSS JOIN ${ref("dim_police_station")} ps
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY c.unique_id ORDER BY ST_Distance(c.geography, ps.geography) ASC) = 1
+),
+
+map_signal AS (
+    SELECT 
+        c.unique_id, 
+        sig.signal_key
+    FROM map_time c
+    JOIN ${ref("dim_traffic_signal")} sig 
+        ON CAST(c.cnn_intersection AS INT64) = CAST(sig.cnn AS INT64)
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY c.unique_id) = 1
+),
+
+--------------------------------------------------------------------------------
+-- Stage 4 : Text-based Lookups
+--------------------------------------------------------------------------------
+env_lookup AS (
+    SELECT 
+        c.unique_id, 
+        e.environment_key
+    FROM map_time c
+    LEFT JOIN ${ref("dim_environment")} e
+        ON IFNULL(TRIM(c.weather_1), "Unknown") = e.weather_condition_1
+       AND IFNULL(TRIM(c.weather_2), "Unknown") = e.weather_condition_2
+       AND IFNULL(TRIM(c.lighting), "Unknown") = e.lighting
+       AND IFNULL(TRIM(c.road_surface), "Unknown") = e.road_surface
+       AND IFNULL(TRIM(c.road_condition_1), "Unknown") = e.road_condition_1
+       AND IFNULL(TRIM(c.road_condition_2), "Unknown") = e.road_condition_2
+       AND IFNULL(TRIM(c.control_device), "Unknown") = e.control_device
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY c.unique_id) = 1
+),
+
+neigh_lookup AS (
+    SELECT 
+        c.unique_id, 
+        n.neighborhood_key
+    FROM map_time c
+    LEFT JOIN ${ref("dim_neighborhood")} n
+        ON UPPER(TRIM(c.analysis_neighborhood)) = UPPER(TRIM(n.neighborhood_name))
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY c.unique_id) = 1
+),
+
+--------------------------------------------------------------------------------
+-- Stage 5 : Fact Construction
+--------------------------------------------------------------------------------
+fact_base AS (
+    SELECT
+        ------------------------------------------------------------
+        -- 1. Foreign Keys
+        ------------------------------------------------------------
+        c.date_key,
+        c.time_key,
+        COALESCE(ml.location_key, CAST(c.cnn_segment AS INT64), CAST(c.cnn_intersection AS INT64)) AS location_key,
+        nl.neighborhood_key,
+        mc.camera_key,
+        mp.police_station_key,
+        ms.signal_key,
+        el.environment_key,
+
+        ------------------------------------------------------------
+        -- 2. Business Timestamp 
+        ------------------------------------------------------------
+        c.collision_datetime,
+        
+        ------------------------------------------------------------
+        -- 3. Degenerate Dimensions (Thuộc tính sự kiện)
+        ------------------------------------------------------------
+        c.unique_id,
+        c.case_id,
+        c.juris,
+        c.police_district,
+        c.reporting_district,
+        c.beat_number,
+        c.primary_road,
+        c.secondary_road,
+        c.intersection,
+        c.direction,
+        c.collision_severity,
+        c.type_of_collision,
+        c.mviw,
+        c.ped_action,
+        c.pcf_code,
+        c.pcf_group,
+        c.pcf_description,
+        c.dph_collision_group,
+        c.party_at_fault,
+        c.party1_type,
+        c.party2_type,
+
+        ------------------------------------------------------------
+        -- 4. Measures
+        ------------------------------------------------------------
+        COALESCE(c.number_killed, 0) AS number_killed,
+        COALESCE(c.number_injured, 0) AS number_injured,
+
+        ------------------------------------------------------------
+        -- 5. Spatial
+        ------------------------------------------------------------
+        c.geography
+
+    FROM map_time c -- Đọc từ CTE đã join đủ date và time
+    LEFT JOIN map_location ml ON c.unique_id = ml.unique_id
+    LEFT JOIN map_camera mc ON c.unique_id = mc.unique_id
+    LEFT JOIN map_police mp ON c.unique_id = mp.unique_id
+    LEFT JOIN map_signal ms ON c.unique_id = ms.unique_id
+    LEFT JOIN env_lookup el ON c.unique_id = el.unique_id
+    LEFT JOIN neigh_lookup nl ON c.unique_id = nl.unique_id
+)
+
+SELECT * FROM fact_base

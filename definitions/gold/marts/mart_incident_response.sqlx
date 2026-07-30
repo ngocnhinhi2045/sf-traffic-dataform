@@ -1,0 +1,87 @@
+config {
+    type: "table",
+    schema: "sf_traffic_mart",
+    name: "mart_incident_response",
+    description: "Incident Response Mart: Điều phối xử lý sự cố Live, liên kết Work Zone và Camera",
+    tags: ["mart", "incident", "dispatch"],
+    bigquery: {
+        partitionBy: "DATE(incident_updated_time)",
+        clusterBy: ["event_type", "severity", "has_active_workzone"]
+    }
+}
+
+WITH active_workzones AS (
+    SELECT 
+        location_key,
+        work_zone_id,
+        start_date,
+        end_date,
+        -- Bổ sung KPI thời lượng công trường
+        TIMESTAMP_DIFF(end_date, start_date, HOUR) AS duration_hours,
+        description AS workzone_description
+    FROM ${ref("fact_work_zone")}
+    -- Lọc chuẩn xác trạng thái tĩnh/đóng
+    WHERE UPPER(event_status) NOT IN ('COMPLETED', 'CLOSED', 'RESOLVED', 'INACTIVE')
+),
+active_incidents AS (
+    SELECT 
+        incident_id,
+        location_key,
+        camera_key,
+        date_key,
+        time_key,
+        event_type,
+        severity,
+        status,
+        updated AS incident_updated_time,
+        headline
+    FROM ${ref("fact_traffic_incident")}
+    WHERE UPPER(status) NOT IN ('COMPLETED', 'CLOSED', 'RESOLVED', 'INACTIVE')
+)
+
+SELECT 
+    i.incident_id,
+    i.incident_updated_time,
+    
+    -- Phân loại sự cố
+    i.event_type,
+    i.severity,
+    i.status AS incident_status,
+    i.headline,
+    
+    -- Địa điểm sự cố
+    l.street_name,
+    l.neighborhood,
+    
+    -- Tích hợp Work Zone (Sự cố có trùng với khu vực thi công không?)
+    CASE WHEN wz.work_zone_id IS NOT NULL THEN TRUE ELSE FALSE END AS has_active_workzone,
+    wz.work_zone_id,
+    wz.workzone_description,
+    wz.duration_hours AS workzone_duration_hours,
+    
+    -- Tích hợp Camera (Điều phối hình ảnh)
+    CASE WHEN c.camera_id IS NOT NULL THEN TRUE ELSE FALSE END AS has_nearby_camera,
+    c.camera_id,
+    c.streaming_video_url,
+    
+    -- Kịch bản Điều phối (Dispatch Action)
+    CASE 
+        WHEN i.severity IN ('Severe', 'Major') AND c.camera_id IS NOT NULL THEN 'Mở Camera khẩn cấp & Trực tiếp điều xe cứu hộ'
+        WHEN i.severity IN ('Severe', 'Major') AND c.camera_id IS NULL THEN 'Mất tầm nhìn - Cử đội tuần tra đến hiện trường ngay'
+        WHEN wz.work_zone_id IS NOT NULL THEN 'Cảnh báo ùn tắc do công trình & Phân luồng từ xa'
+        ELSE 'Theo dõi tiêu chuẩn'
+    END AS dispatch_action
+
+FROM active_incidents i
+LEFT JOIN ${ref("dim_location_street")} l ON i.location_key = l.location_key
+LEFT JOIN ${ref("dim_camera")} c ON i.camera_key = c.camera_key
+-- Gộp 1 công trường đang active tại cùng location (Tránh nhân bản dòng nếu có nhiều lô cốt nhỏ)
+LEFT JOIN (
+    SELECT 
+        location_key, 
+        ANY_VALUE(work_zone_id) AS work_zone_id,
+        ANY_VALUE(duration_hours) AS duration_hours,
+        ANY_VALUE(workzone_description) AS workzone_description
+    FROM active_workzones
+    GROUP BY location_key
+) wz ON i.location_key = wz.location_key

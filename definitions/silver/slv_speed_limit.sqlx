@@ -1,0 +1,139 @@
+config {
+    type: "table",
+    schema: "sf_traffic_silver",
+    name: "slv_speed_limit",
+    description: "Silver layer - Standardized street speed limit dataset (CSV Source)",
+    tags: ["silver", "dimension"],
+    columns: {
+        object_id: "Unique object identifier",
+        cnn: "Street segment identifier",
+        speed_limit: "Legal speed limit (mph)",
+        geography: "Road segment geometry"
+    },
+    assertions: {
+        nonNull: ["object_id", "cnn", "speed_limit", "geography"],
+        uniqueKey: ["object_id"]
+    },
+    bigquery: {
+        clusterBy: ["analysis_neighborhood", "supervisor_district"]
+    }
+}
+
+--------------------------------------------------------------------------------
+-- Stage 1 : Source
+--------------------------------------------------------------------------------
+WITH source AS (
+    SELECT *
+    FROM ${ref("ext_speed_limit")}
+),
+
+--------------------------------------------------------------------------------
+-- Stage 2 : Schema Standardization
+--------------------------------------------------------------------------------
+standardized AS (
+    SELECT
+        -- 1. Các cột định danh (Ép kiểu an toàn từ CSV)
+        SAFE_CAST(TRIM(CAST(objectid AS STRING)) AS INT64) AS object_id,
+        SAFE_CAST(TRIM(CAST(cnn AS STRING)) AS INT64)      AS cnn,
+        
+        -- 2. Các cột văn bản (Đổi tên cột st_type -> street_type cho khớp Cách 2)
+        TRIM(CAST(street AS STRING))                       AS street,
+        TRIM(CAST(st_type AS STRING))                      AS street_type,
+        TRIM(CAST(from_st AS STRING))                      AS from_st,
+        TRIM(CAST(to_st AS STRING))                        AS to_st,
+        TRIM(CAST(status AS STRING))                       AS status,
+        TRIM(CAST(analysis_neighborhood AS STRING))        AS analysis_neighborhood,
+        SAFE_CAST(TRIM(CAST(supervisor_district AS STRING)) AS INT64) AS supervisor_district,
+
+        -- 3. Chuẩn hóa chỉ số vận tốc trực tiếp (Kế thừa xuất sắc logic Cách 1)
+        CASE 
+            WHEN SAFE_CAST(TRIM(CAST(speedlimit AS STRING)) AS INT64) = 0 
+                 AND UPPER(TRIM(COALESCE(CAST(st_type AS STRING), ''))) <> 'ALY'
+            THEN 25
+            ELSE SAFE_CAST(TRIM(CAST(speedlimit AS STRING)) AS INT64) 
+        END AS speed_limit,
+
+        -- 4. Cột cờ Boolean (Xử lý an toàn cho CSV)
+        CASE 
+            WHEN UPPER(TRIM(CAST(schoolzone AS STRING))) IN ('TRUE', '1', 'YES') THEN TRUE 
+            ELSE FALSE 
+        END AS school_zone,
+
+        SAFE_CAST(TRIM(CAST(schoolzone_limit AS STRING)) AS INT64) AS school_zone_limit,
+
+        -- 5. Cột không gian 
+        ST_GEOGFROMTEXT(CAST(shape AS STRING))             AS geography
+
+    FROM source
+),
+
+--------------------------------------------------------------------------------
+-- Stage 3 : Data Cleansing
+--------------------------------------------------------------------------------
+cleaned AS (
+    SELECT *
+    FROM standardized
+    WHERE
+        object_id IS NOT NULL
+),
+
+--------------------------------------------------------------------------------
+-- Stage 4 : Data Transformation
+--------------------------------------------------------------------------------
+transformed AS (
+    SELECT *
+    FROM cleaned
+),
+
+--------------------------------------------------------------------------------
+-- Stage 5 : Data Quality Validation
+--------------------------------------------------------------------------------
+validated AS (
+    SELECT *
+    FROM transformed
+    WHERE
+        speed_limit >= 0
+        AND geography IS NOT NULL
+),
+
+--------------------------------------------------------------------------------
+-- Stage 6 : Deduplication
+--------------------------------------------------------------------------------
+deduplicated AS (
+    SELECT *
+    FROM validated
+    -- Lưu ý: Tôi đổi thành ORDER BY object_id để đảm bảo chạy được như Cách 2, 
+    -- Nếu file gốc của bạn thực sự có cột data_loaded_at, hãy đổi lại theo Cách 1 của bạn.
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY object_id 
+        ORDER BY object_id
+    ) = 1
+),
+
+--------------------------------------------------------------------------------
+-- Stage 7 : Publish
+--------------------------------------------------------------------------------
+final AS (
+    SELECT
+        object_id,
+        cnn,
+        street,
+        street_type,
+        from_st,
+        to_st,
+        speed_limit,
+        school_zone,
+        school_zone_limit,
+        status,
+        analysis_neighborhood,
+        supervisor_district,
+        geography,
+        
+        CURRENT_TIMESTAMP() AS _etl_loaded_at,
+        "ext_speed_limit_csv" AS _source_system,
+        "Silver" AS _layer,
+        "1.1" AS _pipeline_version
+    FROM deduplicated
+)
+
+SELECT * FROM final

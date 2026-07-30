@@ -1,0 +1,43 @@
+config {
+    type: "table",
+    schema: "sf_traffic_gold",
+    name: "dim_police_station",
+    description: "Police Station Dimension",
+    tags: ["gold", "dimension"],
+    assertions: {
+        uniqueKey: ["police_station_key"],
+        nonNull: ["police_station_key", "station_code", "station_name"]
+    }
+}
+
+WITH source AS (
+    SELECT *
+    FROM ${ref("slv_police_station")}
+),
+cleaned AS (
+    SELECT 
+        station_code,
+        station_name,
+        address,
+        phone,
+        geography
+    FROM source
+    WHERE station_code IS NOT NULL
+      AND station_name IS NOT NULL
+    -- Sử dụng QUALIFY thay cho DISTINCT để xử lý an toàn cột GEOGRAPHY
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY station_code 
+        ORDER BY station_name
+    ) = 1
+),
+final AS (
+    SELECT
+        ROW_NUMBER() OVER(ORDER BY station_code) AS police_station_key,
+        station_code,
+        station_name,
+        address,
+        phone,
+        geography
+    FROM cleaned
+)
+SELECT * FROM final

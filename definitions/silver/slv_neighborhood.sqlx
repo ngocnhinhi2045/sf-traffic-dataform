@@ -1,0 +1,110 @@
+config {
+    type: "table",
+    schema: "sf_traffic_silver",
+    name: "slv_neighborhood",
+    description: "Silver layer - Standardized neighborhood dataset (CSV Source with WKT)",
+    tags: ["silver", "dimension"],
+    columns: {
+        neighborhood_id: "Neighborhood identifier (Generated Hash)",
+        neighborhood_name: "Neighborhood name",
+        geography: "Neighborhood geometry (WKT)"
+    },
+    assertions: {
+        nonNull: ["neighborhood_id", "neighborhood_name", "geography"],
+        uniqueKey: ["neighborhood_id"]
+    },
+    bigquery: {
+        clusterBy: ["neighborhood_name"]
+    }
+}
+
+--------------------------------------------------------------------------------
+-- Stage 1 : Source
+--------------------------------------------------------------------------------
+WITH source AS (
+    SELECT *
+    FROM ${ref("sf_traffic_bronze", "ext_neighborhood")}
+),
+
+--------------------------------------------------------------------------------
+-- Stage 2 : Schema Standardization
+--------------------------------------------------------------------------------
+standardized AS (
+    SELECT
+        -- 1. Tạo Surrogate Key (ID nhân tạo) từ tên khu vực
+        CAST(ABS(FARM_FINGERPRINT(TRIM(CAST(string_field_1 AS STRING)))) AS STRING) AS neighborhood_id,
+        
+        -- 2. Tên khu vực
+        TRIM(CAST(string_field_1 AS STRING)) AS neighborhood_name,
+        
+        -- 3. Ép kiểu WKT sang GEOGRAPHY (Giữ nguyên logic chuẩn xác từ Cách 1 của bạn)
+        ST_GEOGFROMTEXT(CAST(string_field_0 AS STRING)) AS geography,
+        
+        -- Lấy tạm cột thô để lọc Header rác ở bước sau
+        CAST(string_field_1 AS STRING) AS raw_name
+    FROM source
+),
+
+--------------------------------------------------------------------------------
+-- Stage 3 : Data Cleansing
+--------------------------------------------------------------------------------
+cleaned AS (
+    SELECT 
+        neighborhood_id,
+        neighborhood_name,
+        geography
+    FROM standardized
+    WHERE
+        neighborhood_name IS NOT NULL
+        -- Lọc bỏ dòng tiêu đề bị kẹt (logic từ Cách 1)
+        AND raw_name != 'string_field_1' 
+        AND raw_name != ''
+),
+
+--------------------------------------------------------------------------------
+-- Stage 4 : Data Transformation
+--------------------------------------------------------------------------------
+transformed AS (
+    SELECT *
+    FROM cleaned
+),
+
+--------------------------------------------------------------------------------
+-- Stage 5 : Data Quality Validation
+--------------------------------------------------------------------------------
+validated AS (
+    SELECT *
+    FROM transformed
+    WHERE
+        geography IS NOT NULL
+),
+
+--------------------------------------------------------------------------------
+-- Stage 6 : Deduplication
+--------------------------------------------------------------------------------
+deduplicated AS (
+    SELECT *
+    FROM validated
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY neighborhood_id 
+        ORDER BY neighborhood_name
+    ) = 1
+),
+
+--------------------------------------------------------------------------------
+-- Stage 7 : Publish
+--------------------------------------------------------------------------------
+final AS (
+    SELECT
+        neighborhood_id,
+        neighborhood_name,
+        geography,
+        
+        CURRENT_TIMESTAMP() AS _etl_loaded_at,
+        "ext_neighborhood_csv" AS _source_system,
+        "Silver" AS _layer,
+        "1.1" AS _pipeline_version
+    FROM deduplicated
+)
+
+SELECT * FROM final

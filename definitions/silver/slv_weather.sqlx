@@ -1,0 +1,142 @@
+config {
+    type: "table",
+    schema: "sf_traffic_silver",
+    name: "slv_weather",
+    description: "Silver layer - Standardized weather dataset (SF Only)",
+    tags: ["silver", "weather", "fact"],
+    columns: {
+        location_id: "Numeric location ID (1 for San Francisco)",
+        weather_timestamp: "Observation timestamp",
+        location_geography: "Weather station location (Point)"
+    },
+    assertions: {
+        nonNull: ["weather_timestamp"],
+        // Nhờ chỉ còn 1 quận SF, weather_timestamp chính là Unique Key hoàn hảo
+        uniqueKey: ["weather_timestamp"]
+    },
+    bigquery: {
+        partitionBy: "DATE(weather_timestamp)",
+        clusterBy: ["weathercode"]
+    }
+}
+
+--------------------------------------------------------------------------------
+-- Stage 1 : Source
+--------------------------------------------------------------------------------
+WITH source AS (
+    SELECT *
+    FROM ${ref("raw_weather")}
+),
+
+--------------------------------------------------------------------------------
+-- Stage 2 : Schema Standardization 
+--------------------------------------------------------------------------------
+standardized AS (
+    SELECT
+        -- 1. Xử lý Location (Chỉ còn San Francisco)
+        CASE TRIM(CAST(location_id AS STRING))
+            WHEN 'San Francisco' THEN 1
+            ELSE 99 
+        END AS location_id,
+        TRIM(CAST(location_id AS STRING)) AS location_name,
+        
+        -- Hardcode timezone cho SF Bay Area
+        'America/Los_Angeles' AS timezone,
+        -28800 AS utc_offset_seconds, 
+        
+        -- 2. Thời gian
+        SAFE_CAST(TRIM(CAST(time AS STRING)) AS TIMESTAMP) AS weather_timestamp,
+        
+        -- 3. Tọa độ
+        SAFE_CAST(TRIM(CAST(latitude AS STRING)) AS FLOAT64) AS latitude,
+        SAFE_CAST(TRIM(CAST(longitude AS STRING)) AS FLOAT64) AS longitude,
+        
+        -- 4. Các chỉ số thời tiết 
+        SAFE_CAST(TRIM(CAST(temperature_2m AS STRING)) AS FLOAT64)       AS temperature_2m,
+        SAFE_CAST(TRIM(CAST(apparent_temperature AS STRING)) AS FLOAT64) AS apparent_temperature,
+        SAFE_CAST(TRIM(CAST(rain AS STRING)) AS FLOAT64)                 AS rain_mm,
+        SAFE_CAST(TRIM(CAST(snowfall AS STRING)) AS FLOAT64)             AS snowfall_cm,
+        SAFE_CAST(TRIM(CAST(snow_depth AS STRING)) AS FLOAT64)           AS snow_depth_m,
+        SAFE_CAST(TRIM(CAST(weather_code AS STRING)) AS INT64)           AS weathercode,
+        SAFE_CAST(TRIM(CAST(wind_speed_10m AS STRING)) AS FLOAT64)       AS wind_speed_10m,
+        SAFE_CAST(TRIM(CAST(wind_gusts_10m AS STRING)) AS FLOAT64)       AS wind_gusts_10m
+
+    FROM source
+),
+
+--------------------------------------------------------------------------------
+-- Stage 3 : Data Cleansing
+--------------------------------------------------------------------------------
+cleaned AS (
+    SELECT *
+    FROM standardized
+    WHERE
+        weather_timestamp IS NOT NULL
+),
+
+--------------------------------------------------------------------------------
+-- Stage 4 : Data Transformation
+--------------------------------------------------------------------------------
+transformed AS (
+    SELECT
+        *,
+        ST_GEOGPOINT(longitude, latitude) AS location_geography
+    FROM cleaned
+),
+
+--------------------------------------------------------------------------------
+-- Stage 5 : Data Quality Validation
+--------------------------------------------------------------------------------
+validated AS (
+    SELECT *
+    FROM transformed
+    WHERE
+        latitude BETWEEN -90 AND 90
+        AND longitude BETWEEN -180 AND 180
+        AND location_geography IS NOT NULL
+        AND (temperature_2m BETWEEN -80 AND 80 OR temperature_2m IS NULL)
+        AND (wind_speed_10m >= 0 OR wind_speed_10m IS NULL)
+),
+
+--------------------------------------------------------------------------------
+-- Stage 6 : Deduplication
+--------------------------------------------------------------------------------
+deduplicated AS (
+    SELECT *
+    FROM validated
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY weather_timestamp 
+        ORDER BY weather_timestamp DESC
+    ) = 1
+),
+
+--------------------------------------------------------------------------------
+-- Stage 7 : Publish
+--------------------------------------------------------------------------------
+final AS (
+    SELECT
+        location_id,
+        location_name,
+        timezone,
+        utc_offset_seconds,
+        weather_timestamp,
+        latitude,
+        longitude,
+        location_geography,
+        temperature_2m,
+        apparent_temperature,
+        rain_mm,
+        snowfall_cm,
+        snow_depth_m,
+        weathercode,
+        wind_speed_10m,
+        wind_gusts_10m,
+        
+        CURRENT_TIMESTAMP() AS _etl_loaded_at,
+        "raw_weather_csv" AS _source_system,
+        "Silver" AS _layer,
+        "1.1" AS _pipeline_version
+    FROM deduplicated
+)
+
+SELECT * FROM final

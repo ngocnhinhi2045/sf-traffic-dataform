@@ -1,0 +1,52 @@
+config {
+    type: "table",
+    schema: "sf_traffic_gold",
+    name: "fact_traffic_flow_daily",
+    description: "Bảng Fact Roll-up Lưu lượng Giao thông theo ngày (Chỉ lấy dữ liệu chuẩn)",
+    tags: ["gold", "fact", "rollup"],
+    bigquery: {
+        partitionBy: "flow_date",
+        clusterBy: ["station_id", "district", "route"]
+    }
+}
+
+WITH 
+filtered_facts AS (
+    SELECT 
+        *,
+        -- Tạo lại kiểu DATE để dùng cho cơ chế Partition
+        PARSE_DATE('%Y%m%d', CAST(date_key AS STRING)) AS flow_date
+    FROM ${ref("fact_traffic_flow")}
+    -- Chỉ tính tổng hợp cho các dòng dữ liệu không bị lỗi cảm biến
+    WHERE data_quality_flag = 'VALID'
+)
+SELECT
+    CAST(FARM_FINGERPRINT(CONCAT(
+        CAST(station_id AS STRING), '|', 
+        CAST(date_key AS STRING)
+    )) AS INT64) AS daily_flow_key,
+    
+    date_key,
+    flow_date,
+    station_id,
+    district,
+    route,
+    direction,
+    lane_type,
+    
+    -- Các chỉ số Roll-up
+    SUM(total_flow) AS total_daily_flow,
+    -- Công thức tính vận tốc trung bình có trọng số (Weighted Average)
+    SUM(total_flow * avg_speed) / NULLIF(SUM(total_flow), 0) AS daily_avg_speed,
+    AVG(avg_occupancy) AS daily_avg_occupancy,
+    SUM(samples) AS total_daily_samples
+
+FROM filtered_facts
+GROUP BY
+    date_key,
+    flow_date,
+    station_id,
+    district,
+    route,
+    direction,
+    lane_type

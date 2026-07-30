@@ -1,0 +1,152 @@
+config {
+    type: "table",
+    schema: "sf_traffic_silver",
+    name: "slv_street",
+    description: "Silver layer - Standardized street network dataset (CSV Source)",
+    tags: ["silver", "dimension"],
+    columns: {
+        cnn: "Street segment identifier",
+        street_name: "Street name",
+        geography: "Street geometry (WKT)"
+    },
+    assertions: {
+        nonNull: ["cnn", "street_name", "geography"],
+        uniqueKey: ["cnn"]
+    },
+    bigquery: {
+        clusterBy: ["analysis_neighborhood", "supervisor_district"]
+    }
+}
+
+--------------------------------------------------------------------------------
+-- Stage 1 : Source
+--------------------------------------------------------------------------------
+WITH source AS (
+    SELECT *
+    FROM ${ref("ext_street")}
+),
+
+--------------------------------------------------------------------------------
+-- Stage 2 : Schema Standardization (Kết hợp logic xử lý CSV an toàn)
+--------------------------------------------------------------------------------
+standardized AS (
+    SELECT
+        -- 1. Các ID định danh 
+        SAFE_CAST(TRIM(CAST(cnn AS STRING)) AS INT64)        AS cnn,
+        SAFE_CAST(TRIM(CAST(f_node_cnn AS STRING)) AS INT64) AS from_node,
+        SAFE_CAST(TRIM(CAST(t_node_cnn AS STRING)) AS INT64) AS to_node,
+        SAFE_CAST(TRIM(CAST(classcode AS STRING)) AS INT64)  AS class_code,
+        SAFE_CAST(TRIM(CAST(zip_code AS STRING)) AS INT64)   AS zip_code,
+        
+        -- 2. Các cột văn bản (Đã đổi tên đồng bộ với Cách 2)
+        TRIM(CAST(street AS STRING))                         AS street,
+        TRIM(CAST(st_type AS STRING))                        AS street_type,
+        TRIM(CAST(f_st AS STRING))                           AS from_street,
+        TRIM(CAST(t_st AS STRING))                           AS to_street,
+        TRIM(CAST(jurisdiction AS STRING))                   AS jurisdiction,
+        TRIM(CAST(layer AS STRING))                          AS layer,
+        TRIM(CAST(nhood AS STRING))                          AS neighborhood,
+        TRIM(CAST(oneway AS STRING))                         AS oneway,
+        TRIM(CAST(street_gc AS STRING))                      AS street_gc,
+        TRIM(CAST(streetname AS STRING))                     AS street_name,
+        TRIM(CAST(streetname_gc AS STRING))                  AS street_name_gc,
+        TRIM(CAST(analysis_neighborhood AS STRING))          AS analysis_neighborhood,
+        SAFE_CAST(TRIM(CAST(supervisor_district AS STRING)) AS INT64) AS supervisor_district,
+        
+        -- 3. Kiểu Cờ Boolean (Kế thừa logic xử lý CSV cực tốt từ Cách 1)
+        CASE 
+            WHEN UPPER(TRIM(CAST(accepted AS STRING))) IN ('TRUE', '1', 'YES') THEN TRUE 
+            ELSE FALSE 
+        END AS accepted,
+        
+        CASE 
+            WHEN UPPER(TRIM(CAST(active AS STRING))) IN ('TRUE', '1', 'YES') THEN TRUE 
+            ELSE FALSE 
+        END AS active,
+        
+        -- 4. Không gian
+        ST_GEOGFROMTEXT(CAST(line AS STRING))                AS geography
+
+    FROM source
+),
+
+--------------------------------------------------------------------------------
+-- Stage 3 : Data Cleansing
+--------------------------------------------------------------------------------
+cleaned AS (
+    SELECT *
+    FROM standardized
+    WHERE
+        cnn IS NOT NULL
+        
+        -- BỔ SUNG BỘ LỌC SAN FRANCISCO:
+        AND accepted = TRUE
+),
+
+--------------------------------------------------------------------------------
+-- Stage 4 : Data Transformation
+--------------------------------------------------------------------------------
+transformed AS (
+    SELECT *
+    FROM cleaned
+),
+
+--------------------------------------------------------------------------------
+-- Stage 5 : Data Quality Validation
+--------------------------------------------------------------------------------
+validated AS (
+    SELECT *
+    FROM transformed
+    WHERE
+        geography IS NOT NULL
+),
+
+--------------------------------------------------------------------------------
+-- Stage 6 : Deduplication
+--------------------------------------------------------------------------------
+deduplicated AS (
+    SELECT *
+    FROM validated
+    -- Lưu ý: Nếu dữ liệu gốc của bạn thực sự có cột data_loaded_at như bạn viết ở Cách 1,
+    -- bạn có thể đổi 'ORDER BY cnn' thành 'ORDER BY data_loaded_at DESC' để lấy dòng mới nhất.
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY cnn 
+        ORDER BY cnn
+    ) = 1
+),
+
+--------------------------------------------------------------------------------
+-- Stage 7 : Publish
+--------------------------------------------------------------------------------
+final AS (
+    SELECT
+        cnn,
+        street,
+        street_type,
+        street_name,
+        street_name_gc,
+        street_gc,
+        from_street,
+        to_street,
+        from_node,
+        to_node,
+        accepted,
+        active,
+        class_code,
+        jurisdiction,
+        layer,
+        neighborhood,
+        oneway,
+        zip_code,
+        analysis_neighborhood,
+        supervisor_district,
+        geography,
+        
+        CURRENT_TIMESTAMP() AS _etl_loaded_at,
+        "ext_street_csv" AS _source_system,
+        "Silver" AS _layer,
+        "1.1" AS _pipeline_version
+    FROM deduplicated
+)
+
+SELECT * FROM final

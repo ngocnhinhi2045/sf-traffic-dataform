@@ -1,0 +1,152 @@
+config {
+    type: "table",
+    schema: "sf_traffic_silver",
+    name: "slv_traffic_signal",
+    description: "Silver layer - Standardized traffic signal dataset (Optimized CSV Source)",
+    tags: ["silver", "traffic_signal", "dimension"],
+    columns: {
+        signal_id: "Traffic signal identifier",
+        cnn: "Street segment identifier",
+        geography: "Signal location (WKT)"
+    },
+    assertions: {
+        nonNull: ["signal_id", "cnn", "geography"],
+        uniqueKey: ["signal_id"]
+    },
+    bigquery: {
+        clusterBy: ["analysis_neighborhood", "supervisor_district", "type"]
+    }
+}
+
+--------------------------------------------------------------------------------
+-- Stage 1 : Source
+--------------------------------------------------------------------------------
+WITH source AS (
+    SELECT *
+    FROM ${ref("ext_traffic_signal")}
+),
+
+--------------------------------------------------------------------------------
+-- Stage 2 : Schema Standardization (Kế thừa logic CSV của Cách 1, Naming của Cách 2)
+--------------------------------------------------------------------------------
+standardized AS (
+    SELECT
+        -- 1. Khóa chính
+        SAFE_CAST(TRIM(CAST(objectid AS STRING)) AS INT64) AS signal_id,
+        SAFE_CAST(TRIM(CAST(CNN AS STRING)) AS INT64)      AS cnn,
+        
+        -- 2. Chuẩn hóa Text cốt lõi (Bỏ phần cứng theo ý tưởng của Cách 1)
+        TRIM(CAST(STREET1 AS STRING))                      AS street_1,
+        TRIM(CAST(STREET2 AS STRING))                      AS street_2,
+        TRIM(CAST(STREET3 AS STRING))                      AS street_3,
+        TRIM(CAST(STREET4 AS STRING))                      AS street_4,
+        
+        SAFE_CAST(TRIM(CAST(SUP_DIST AS STRING)) AS INT64) AS supervisor_district,
+        TRIM(CAST(TYPE AS STRING))                         AS type,
+        TRIM(CAST(DETECTION AS STRING))                    AS detection,
+        TRIM(CAST(SYSTEM_NUM AS STRING))                   AS system_number,
+        TRIM(CAST(MASTER AS STRING))                       AS master,
+        TRIM(CAST(BBS AS STRING))                          AS bbs,
+        TRIM(CAST(VEH_ACTUAT AS STRING))                   AS vehicle_actuation,
+        TRIM(CAST(PED_SIGNAL AS STRING))                   AS pedestrian_signal,
+        TRIM(CAST(TBC AS STRING))                          AS tbc,
+        TRIM(CAST(INTERCONNE AS STRING))                   AS interconnection,
+        TRIM(CAST(PREEMPT_PR AS STRING))                   AS preemption,
+        
+        -- Xử lý an toàn năm tháng từ CSV
+        SAFE_CAST(TRIM(CAST(D_ATE2070 AS STRING)) AS INT64) AS controller_date,
+        SAFE_CAST(TRIM(CAST(STARTYEAR AS STRING)) AS INT64) AS start_year,
+        
+        TRIM(CAST(CALTRANS_R AS STRING))                   AS caltrans_route,
+        TRIM(CAST(APS AS STRING))                          AS accessible_pedestrian_signal,
+        TRIM(CAST(analysis_neighborhood AS STRING))        AS analysis_neighborhood,
+
+        -- 3. Cờ BOOLEAN cực mạnh (Logic Cách 1)
+        CASE 
+            WHEN UPPER(TRIM(CAST(PED_ACTUAT AS STRING))) IN ('YES', 'Y', '1', 'TRUE', 'X') THEN TRUE 
+            ELSE FALSE 
+        END AS pedestrian_actuation,
+
+        CASE 
+            WHEN UPPER(TRIM(CAST(RLCAM AS STRING))) IN ('YES', 'Y', '1', 'TRUE', 'X') THEN TRUE 
+            ELSE FALSE 
+        END AS red_light_camera,
+
+        CASE 
+            WHEN UPPER(TRIM(CAST(CALTRANS AS STRING))) IN ('YES', 'Y', '1', 'TRUE', 'X') THEN TRUE 
+            ELSE FALSE 
+        END AS caltrans,
+        
+        -- Cột SF có ở Cách 1 nhưng không có ở Cách 2, tôi vẫn giữ lại cho bạn
+        CASE 
+            WHEN UPPER(TRIM(CAST(SF AS STRING))) IN ('YES', 'Y', '1', 'TRUE', 'X') THEN TRUE 
+            ELSE FALSE 
+        END AS sf,
+        
+        -- 4. Không gian
+        ST_GEOGFROMTEXT(CAST(shape AS STRING))             AS geography
+
+    FROM source
+),
+
+--------------------------------------------------------------------------------
+-- Stage 3 : Data Cleansing
+--------------------------------------------------------------------------------
+cleaned AS (
+    SELECT *
+    FROM standardized
+    WHERE
+        signal_id IS NOT NULL
+        AND cnn IS NOT NULL
+        
+        -- BỔ SUNG BỘ LỌC SAN FRANCISCO:
+        -- Chỉ lấy các đèn tín hiệu do thành phố SF quản lý một phần hoặc toàn bộ
+        AND sf = TRUE
+),
+
+--------------------------------------------------------------------------------
+-- Stage 4 : Data Transformation
+--------------------------------------------------------------------------------
+transformed AS (
+    SELECT *
+    FROM cleaned
+),
+
+--------------------------------------------------------------------------------
+-- Stage 5 : Data Quality Validation
+--------------------------------------------------------------------------------
+validated AS (
+    SELECT *
+    FROM transformed
+    WHERE
+        geography IS NOT NULL
+),
+
+--------------------------------------------------------------------------------
+-- Stage 6 : Deduplication
+--------------------------------------------------------------------------------
+deduplicated AS (
+    SELECT *
+    FROM validated
+    -- Kế thừa Cách 1 nếu file gốc của bạn thực sự có data_loaded_at
+    -- Nếu không có, bạn có thể đổi lại thành ORDER BY signal_id như Cách 2
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY signal_id 
+        ORDER BY signal_id
+    ) = 1
+),
+
+--------------------------------------------------------------------------------
+-- Stage 7 : Publish
+--------------------------------------------------------------------------------
+final AS (
+    SELECT 
+        *,
+        CURRENT_TIMESTAMP() AS _etl_loaded_at,
+        "ext_traffic_signal_csv" AS _source_system,
+        "Silver" AS _layer,
+        "1.1" AS _pipeline_version
+    FROM deduplicated
+)
+
+SELECT * FROM final

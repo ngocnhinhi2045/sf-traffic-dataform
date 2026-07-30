@@ -1,0 +1,83 @@
+config {
+    type: "table",
+    schema: "sf_traffic_mart",
+    name: "mart_traffic_flow",
+    description: "Traffic Flow Mart: Phân tích lưu lượng, vận tốc theo tuyến đường, thời tiết và ngày lễ",
+    tags: ["mart", "flow", "congestion"],
+    bigquery: {
+        partitionBy: "flow_date",
+        clusterBy: ["district", "route", "direction"]
+    }
+}
+
+WITH flow_hourly AS (
+    -- Aggregate từ fact_traffic_flow để giữ độ phân giải theo giờ
+    SELECT 
+        station_id,
+        district,
+        route,
+        direction,
+        date_key,
+        time_key,
+        SUM(total_flow) AS hourly_flow,
+        SUM(total_flow * avg_speed) / NULLIF(SUM(total_flow), 0) AS hourly_avg_speed,
+        AVG(avg_occupancy) AS hourly_avg_occupancy
+    FROM ${ref("fact_traffic_flow")}
+    WHERE data_quality_flag = 'VALID'
+    GROUP BY 
+        station_id, district, route, direction, date_key, time_key
+),
+
+weather_hourly AS (
+    -- Aggregate thời tiết theo giờ để tránh nhân bản dòng (fan-out) khi JOIN
+    SELECT 
+        date_key,
+        time_key,
+        AVG(temperature_2m) AS temp_celsius,
+        AVG(rain_mm) AS rainfall,
+        ANY_VALUE(weathercode) AS weather_condition_code
+    FROM ${ref("fact_weather")}
+    GROUP BY 
+        date_key, time_key
+)
+
+SELECT
+    CAST(FARM_FINGERPRINT(CONCAT(CAST(f.station_id AS STRING), CAST(f.date_key AS STRING), CAST(f.time_key AS STRING))) AS INT64) AS flow_mart_key,
+    d.full_date AS flow_date,
+    t.hour_name AS flow_time,
+    
+    -- Degenerate Dimensions (Từ Fact gốc)
+    f.station_id,
+    f.district,
+    f.route,
+    f.direction,
+    
+    -- Lịch & Giờ giấc (Tích hợp sẵn Holiday từ dim_date)
+    t.time_category,
+    t.is_rush_hour,
+    d.day_name,
+    d.is_weekend,
+    d.is_holiday,
+    d.holiday_name,
+    
+    -- Thời tiết
+    w.temp_celsius,
+    w.rainfall,
+    w.weather_condition_code,
+    
+    -- Chỉ số lưu lượng
+    f.hourly_flow,
+    f.hourly_avg_speed,
+    f.hourly_avg_occupancy,
+    
+    -- Đánh giá kẹt xe (Dựa trên vận tốc tuyệt đối thay vì speed_limit ảo)
+    CASE 
+        WHEN f.hourly_avg_speed < 35 AND t.is_rush_hour THEN 'Severe Congestion (Rush Hour)'
+        WHEN f.hourly_avg_speed < 45 THEN 'Moderate Traffic'
+        ELSE 'Clear / Free Flow'
+    END AS traffic_status
+
+FROM flow_hourly f
+LEFT JOIN ${ref("dim_date")} d ON f.date_key = d.date_key
+LEFT JOIN ${ref("dim_time")} t ON f.time_key = t.time_key
+LEFT JOIN weather_hourly w ON f.date_key = w.date_key AND f.time_key = w.time_key
