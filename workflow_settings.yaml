@@ -1,4 +1,3 @@
 defaultProject: sf-traffic-v2
 defaultDataset: sf_traffic_silver
 defaultAssertionDataset: dataform_assertions
-dataformCoreVersion: 3.0.52
