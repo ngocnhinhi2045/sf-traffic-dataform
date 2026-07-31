@@ -2,86 +2,99 @@ config {
     type: "table",
     schema: "sf_traffic_mart",
     name: "mart_incident_response",
-    description: "Incident Response Mart: Điều phối xử lý sự cố Live, liên kết Work Zone và Camera",
-    tags: ["mart", "incident", "dispatch"],
+    description: "Incident Response Mart: Hợp nhất Sự cố và Khu vực thi công phục vụ bản đồ điều hành thời gian thực",
+    tags: ["mart", "incident", "work_zone", "realtime"],
     bigquery: {
-        partitionBy: "DATE(incident_updated_time)",
-        clusterBy: ["event_type", "severity", "has_active_workzone"]
+        partitionBy: "DATE(event_timestamp)",
+        clusterBy: ["event_category", "event_status", "neighborhood_name"]
     }
 }
 
-WITH active_workzones AS (
+WITH 
+--------------------------------------------------------------------------------
+-- 1. Lấy dữ liệu Sự cố (Incidents)
+--------------------------------------------------------------------------------
+incident_data AS (
     SELECT 
+        'Incident' AS event_category,
+        incident_id AS event_id,
         location_key,
-        work_zone_id,
-        start_date,
-        end_date,
-        -- Bổ sung KPI thời lượng công trường
-        TIMESTAMP_DIFF(end_date, start_date, HOUR) AS duration_hours,
-        description AS workzone_description
-    FROM ${ref("fact_work_zone")}
-    -- Lọc chuẩn xác trạng thái tĩnh/đóng
-    WHERE UPPER(event_status) NOT IN ('COMPLETED', 'CLOSED', 'RESOLVED', 'INACTIVE')
-),
-active_incidents AS (
-    SELECT 
-        incident_id,
-        location_key,
+        neighborhood_key,
         camera_key,
-        date_key,
-        time_key,
+        updated AS event_timestamp,
         event_type,
-        severity,
-        status,
-        updated AS incident_updated_time,
-        headline
+        status AS event_status,
+        severity AS impact_level,
+        headline AS description,
+        roads_direction AS direction, -- Giữ lại hướng di chuyển
+        geography
     FROM ${ref("fact_traffic_incident")}
-    WHERE UPPER(status) NOT IN ('COMPLETED', 'CLOSED', 'RESOLVED', 'INACTIVE')
+),
+
+--------------------------------------------------------------------------------
+-- 2. Lấy dữ liệu Khu vực thi công (Work Zones)
+--------------------------------------------------------------------------------
+work_zone_data AS (
+    SELECT 
+        'Work Zone' AS event_category,
+        work_zone_id AS event_id,
+        location_key,
+        neighborhood_key,
+        CAST(NULL AS INT64) AS camera_key, 
+        start_date AS event_timestamp,
+        event_type,
+        event_status,
+        vehicle_impact AS impact_level,
+        description,
+        direction,
+        geography
+    FROM ${ref("fact_work_zone")}
+),
+
+--------------------------------------------------------------------------------
+-- 3. Hợp nhất hai luồng dữ liệu (UNION ALL)
+--------------------------------------------------------------------------------
+combined_events AS (
+    SELECT * FROM incident_data
+    UNION ALL
+    SELECT * FROM work_zone_data
 )
 
-SELECT 
-    i.incident_id,
-    i.incident_updated_time,
+--------------------------------------------------------------------------------
+-- 4. Trải phẳng với các Dimension (Flattening)
+--------------------------------------------------------------------------------
+SELECT
+    -- Phân loại và Định danh
+    e.event_category,
+    e.event_id,
+    e.event_timestamp,
     
-    -- Phân loại sự cố
-    i.event_type,
-    i.severity,
-    i.status AS incident_status,
-    i.headline,
+    -- Chi tiết sự kiện
+    e.event_type,
+    e.event_status,
+    e.impact_level,
+    e.description,
+    e.direction,
     
-    -- Địa điểm sự cố
-    l.street_name,
-    l.neighborhood,
+    -- Thông tin địa lý & Phân vùng (Lấy tên đường từ bảng Dimension)
+    l.street_name,     -- Đã sửa: Kéo tên đường chuẩn từ Dim Location
+    l.street_class,
+    n.neighborhood_name,
+    l.zip_code,
     
-    -- Tích hợp Work Zone (Sự cố có trùng với khu vực thi công không?)
-    CASE WHEN wz.work_zone_id IS NOT NULL THEN TRUE ELSE FALSE END AS has_active_workzone,
-    wz.work_zone_id,
-    wz.workzone_description,
-    wz.duration_hours AS workzone_duration_hours,
-    
-    -- Tích hợp Camera (Điều phối hình ảnh)
-    CASE WHEN c.camera_id IS NOT NULL THEN TRUE ELSE FALSE END AS has_nearby_camera,
-    c.camera_id,
-    c.streaming_video_url,
-    
-    -- Kịch bản Điều phối (Dispatch Action)
+    -- Thông tin Camera (Cực kỳ quan trọng cho điều hành Real-time)
+    COALESCE(e.camera_key, cam.camera_key) AS matched_camera_key,
     CASE 
-        WHEN i.severity IN ('Severe', 'Major') AND c.camera_id IS NOT NULL THEN 'Mở Camera khẩn cấp & Trực tiếp điều xe cứu hộ'
-        WHEN i.severity IN ('Severe', 'Major') AND c.camera_id IS NULL THEN 'Mất tầm nhìn - Cử đội tuần tra đến hiện trường ngay'
-        WHEN wz.work_zone_id IS NOT NULL THEN 'Cảnh báo ùn tắc do công trình & Phân luồng từ xa'
-        ELSE 'Theo dõi tiêu chuẩn'
-    END AS dispatch_action
+        WHEN e.camera_key IS NOT NULL THEN TRUE 
+        WHEN l.has_camera = TRUE THEN TRUE 
+        ELSE FALSE 
+    END AS is_camera_available,
+    cam.streaming_video_url, 
+    
+    -- GIS Không gian (Để cắm pin lên bản đồ)
+    e.geography
 
-FROM active_incidents i
-LEFT JOIN ${ref("dim_location_street")} l ON i.location_key = l.location_key
-LEFT JOIN ${ref("dim_camera")} c ON i.camera_key = c.camera_key
--- Gộp 1 công trường đang active tại cùng location (Tránh nhân bản dòng nếu có nhiều lô cốt nhỏ)
-LEFT JOIN (
-    SELECT 
-        location_key, 
-        ANY_VALUE(work_zone_id) AS work_zone_id,
-        ANY_VALUE(duration_hours) AS duration_hours,
-        ANY_VALUE(workzone_description) AS workzone_description
-    FROM active_workzones
-    GROUP BY location_key
-) wz ON i.location_key = wz.location_key
+FROM combined_events e
+LEFT JOIN ${ref("dim_location_street")} l ON e.location_key = l.location_key
+LEFT JOIN ${ref("dim_neighborhood")} n ON e.neighborhood_key = n.neighborhood_key
+LEFT JOIN ${ref("dim_camera")} cam ON e.camera_key = cam.camera_key
