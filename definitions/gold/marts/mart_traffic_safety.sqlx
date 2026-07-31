@@ -14,18 +14,39 @@ WITH crash_data AS (
     SELECT 
         c.unique_id, c.collision_datetime, c.location_key, c.police_station_key,
         c.environment_key, c.neighborhood_key, c.date_key, c.time_key,
+        c.camera_key, c.signal_key, -- Kéo thêm key của Camera và Đèn tín hiệu
         c.type_of_collision, c.pcf_description, c.party_at_fault,
         c.number_killed, c.number_injured, c.geography
     FROM ${ref("fact_traffic_crash")} c
 )
 
 SELECT
+    ------------------------------------------------------------
+    -- Thông tin định danh & Thời gian cơ bản
+    ------------------------------------------------------------
     c.unique_id AS crash_id,
     c.collision_datetime,
     d.full_date AS crash_date,
     t.hour_name AS crash_time,
     
-    -- Phân loại mức độ nghiêm trọng (Áp dụng đúng góp ý để vẽ Dashboard)
+    ------------------------------------------------------------
+    -- Các cột thời gian bổ sung (Từ Code 2)
+    ------------------------------------------------------------
+    d.year,
+    d.month,
+    d.month_name,
+    d.day_name,
+    d.is_weekend,
+    d.is_holiday,
+    d.holiday_name,
+    t.hour,
+    t.minute,
+    t.is_rush_hour,
+    t.is_night,
+    
+    ------------------------------------------------------------
+    -- Phân loại mức độ nghiêm trọng & Thương vong
+    ------------------------------------------------------------
     CASE 
         WHEN c.number_killed >= 1 THEN 'Fatal'
         WHEN c.number_injured >= 3 THEN 'Major'
@@ -39,22 +60,34 @@ SELECT
     c.pcf_description AS primary_collision_factor,
     c.party_at_fault,
     
+    ------------------------------------------------------------
     -- Yếu tố môi trường
+    ------------------------------------------------------------
     e.weather_condition_1 AS weather_condition,
     e.lighting,
     e.road_surface,
     e.road_condition_1,
     
-    -- Địa điểm
+    ------------------------------------------------------------
+    -- Địa điểm & Hạ tầng (Camera/Đèn tín hiệu)
+    ------------------------------------------------------------
     l.street_name,
     n.neighborhood_name,
+    l.has_camera,      -- Cờ báo đoạn đường có Camera không
+    l.has_signal,      -- Cờ báo đoạn đường có Đèn tín hiệu không
+    c.camera_key,      -- Key để join xem video stream nếu cần
+    c.signal_key,      -- Key để join xem thông số đèn nếu cần
     
+    ------------------------------------------------------------
     -- Điều phối (Dispatch)
+    ------------------------------------------------------------
     p.station_name AS dispatch_police_station,
     p.phone AS dispatch_phone,
 
+    ------------------------------------------------------------
+    -- GIS Không gian
+    ------------------------------------------------------------
     c.geography
-
 
 FROM crash_data c
 LEFT JOIN ${ref("dim_date")} d ON c.date_key = d.date_key
