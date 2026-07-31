@@ -14,9 +14,15 @@ WITH crash_data AS (
     SELECT 
         c.unique_id, c.collision_datetime, c.location_key, c.police_station_key,
         c.environment_key, c.neighborhood_key, c.date_key, c.time_key,
-        c.camera_key, c.signal_key, -- Kéo thêm key của Camera và Đèn tín hiệu
+        c.camera_key, c.signal_key,
         c.type_of_collision, c.pcf_description, c.party_at_fault,
-        c.number_killed, c.number_injured, c.geography
+        c.number_killed, c.number_injured, c.geography,
+        
+        -- BỔ SUNG SỬA LỖI Ở ĐÂY: Kéo các cột phương tiện từ fact_traffic_crash vào CTE
+        c.party1_type, 
+        c.party2_type, 
+        c.mviw
+        
     FROM ${ref("fact_traffic_crash")} c
 )
 
@@ -30,7 +36,7 @@ SELECT
     t.hour_name AS crash_time,
     
     ------------------------------------------------------------
-    -- Các cột thời gian bổ sung (Từ Code 2)
+    -- Các cột thời gian bổ sung 
     ------------------------------------------------------------
     d.year,
     d.month,
@@ -61,6 +67,13 @@ SELECT
     c.party_at_fault,
     
     ------------------------------------------------------------
+    -- Phương tiện liên quan
+    ------------------------------------------------------------
+    c.party1_type,
+    c.party2_type,
+    c.mviw,
+    
+    ------------------------------------------------------------
     -- Yếu tố môi trường
     ------------------------------------------------------------
     e.weather_condition_1 AS weather_condition,
@@ -73,10 +86,10 @@ SELECT
     ------------------------------------------------------------
     l.street_name,
     n.neighborhood_name,
-    l.has_camera,      -- Cờ báo đoạn đường có Camera không
-    l.has_signal,      -- Cờ báo đoạn đường có Đèn tín hiệu không
-    c.camera_key,      -- Key để join xem video stream nếu cần
-    c.signal_key,      -- Key để join xem thông số đèn nếu cần
+    l.has_camera,      
+    l.has_signal,      
+    c.camera_key,      
+    c.signal_key,      
     
     ------------------------------------------------------------
     -- Điều phối (Dispatch)
