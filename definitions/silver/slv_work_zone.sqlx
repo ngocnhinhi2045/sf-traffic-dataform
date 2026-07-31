@@ -55,7 +55,10 @@ standardized AS (
         SAFE_CAST(JSON_VALUE(properties, '$.core_details.update_date') AS TIMESTAMP) AS update_date,
         
         JSON_VALUE(properties, '$.event_status') AS event_status,
-        JSON_VALUE(properties, '$.vehicle_impact') AS vehicle_impact,
+        CASE 
+            WHEN UPPER(TRIM(JSON_VALUE(properties, '$.vehicle_impact'))) = 'UNKNOWN' THEN 'Unknown'
+            ELSE TRIM(JSON_VALUE(properties, '$.vehicle_impact')) 
+        END AS vehicle_impact,
         JSON_VALUE(properties, '$.beginning_cross_street') AS beginning_cross_street,
         JSON_VALUE(properties, '$.ending_cross_street') AS ending_cross_street,
         
@@ -64,6 +67,9 @@ standardized AS (
 
     FROM source
 ),
+
+
+
 
 --------------------------------------------------------------------------------
 -- Stage 3 : Data Cleansing

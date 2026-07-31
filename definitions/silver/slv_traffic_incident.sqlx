@@ -39,8 +39,14 @@ standardized AS (
         TRIM(CAST(event_type AS STRING)) AS event_type,
         ARRAY_TO_STRING(event_subtypes, ', ') AS event_subtypes,
         TRIM(CAST(status AS STRING)) AS status,
-        TRIM(CAST(severity AS STRING)) AS severity,
         TRIM(CAST(headline AS STRING)) AS headline,
+    
+        -- ĐƯA ĐOẠN SỬA LỖI CHÍNH TẢ VÀO ĐÂY:
+        CASE 
+            WHEN UPPER(TRIM(CAST(severity AS STRING))) = 'UNKNOWN' THEN 'Unknown'
+            ELSE TRIM(CAST(severity AS STRING)) 
+        END AS severity,
+
         
         -- 2. Lịch trình và Thời gian ghi nhận
         ARRAY_TO_STRING(schedule.intervals, ', ') AS schedule_interval,
@@ -60,7 +66,7 @@ standardized AS (
         ARRAY_TO_STRING(ARRAY(SELECT TRIM(CAST(`to` AS STRING)) FROM UNNEST(roads)), ', ') AS roads_to,
         ARRAY_TO_STRING(ARRAY(SELECT TRIM(CAST(lane_type AS STRING)) FROM UNNEST(roads)), ', ') AS roads_lane_type,
         ARRAY_TO_STRING(ARRAY(SELECT TRIM(CAST(article AS STRING)) FROM UNNEST(roads)), ', ') AS roads_article,
-        
+    
         -- 4. Không gian
         ST_GEOGPOINT(
             CAST(geography.coordinates[SAFE_OFFSET(0)] AS FLOAT64),
