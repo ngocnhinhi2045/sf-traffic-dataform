@@ -56,7 +56,7 @@ cleaned AS (
     FROM standardized
     WHERE
         neighborhood_name IS NOT NULL
-        -- Lọc bỏ dòng tiêu đề bị kẹt (logic từ Cách 1)
+        -- Lọc bỏ dòng tiêu đề bị kẹt 
         AND raw_name != 'string_field_1' 
         AND raw_name != ''
 ),

@@ -27,20 +27,23 @@ WITH flow_hourly AS (
     GROUP BY 
         station_id, district, route, direction, date_key, time_key
 ),
-
 weather_hourly AS (
     -- Aggregate thời tiết theo giờ để tránh nhân bản dòng (fan-out) khi JOIN
     SELECT 
         date_key,
         time_key,
         AVG(temperature_2m) AS temp_celsius,
+        AVG(apparent_temperature) AS apparent_temp_celsius, 
         AVG(rain_mm) AS rainfall,
+        AVG(snowfall_cm) AS snowfall, 
+        AVG(snow_depth_m) AS snow_depth, 
+        AVG(wind_speed_10m) AS wind_speed, 
+        AVG(wind_gusts_10m) AS wind_gusts, 
         ANY_VALUE(weathercode) AS weather_condition_code
     FROM ${ref("fact_weather")}
     GROUP BY 
         date_key, time_key
 )
-
 SELECT
     CAST(FARM_FINGERPRINT(CONCAT(CAST(f.station_id AS STRING), CAST(f.date_key AS STRING), CAST(f.time_key AS STRING))) AS INT64) AS flow_mart_key,
     d.full_date AS flow_date,
@@ -60,9 +63,14 @@ SELECT
     d.is_holiday,
     d.holiday_name,
     
-    -- Thời tiết
+    -- Thời tiết 
     w.temp_celsius,
+    w.apparent_temp_celsius,
     w.rainfall,
+    w.snowfall,
+    w.snow_depth,
+    w.wind_speed,
+    w.wind_gusts,
     w.weather_condition_code,
     
     -- Chỉ số lưu lượng
@@ -76,7 +84,6 @@ SELECT
         WHEN f.hourly_avg_speed < 45 THEN 'Moderate Traffic'
         ELSE 'Clear / Free Flow'
     END AS traffic_status
-
 FROM flow_hourly f
 LEFT JOIN ${ref("dim_date")} d ON f.date_key = d.date_key
 LEFT JOIN ${ref("dim_time")} t ON f.time_key = t.time_key

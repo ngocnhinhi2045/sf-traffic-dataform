@@ -22,7 +22,7 @@ source AS (
     FROM ${ref("slv_traffic_flow")}
     WHERE flow_timestamp IS NOT NULL
       AND station_id IS NOT NULL
-      -- Lọc các lỗi vật lý cơ bản (không thể có số âm)
+      -- Lọc các lỗi vật lý cơ bản
       AND total_flow >= 0
       AND avg_occupancy >= 0
       AND avg_speed >= 0
