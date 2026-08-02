@@ -2,7 +2,7 @@ config {
     type: "table",
     schema: "sf_traffic_gold",
     name: "dim_neighborhood",
-    description: "Neighborhood Dimension",
+    description: "Neighborhood Dimension (Sử dụng FARM_FINGERPRINT làm Surrogate Key an toàn)",
     tags: ["gold", "dimension"],
     assertions: {
         uniqueKey: ["neighborhood_key"],
@@ -21,7 +21,6 @@ cleaned AS (
         geography
     FROM source
     WHERE neighborhood_id IS NOT NULL
-    -- Loại bỏ trùng lặp an toàn thay cho DISTINCT
     QUALIFY ROW_NUMBER() OVER(
         PARTITION BY neighborhood_id 
         ORDER BY neighborhood_name
@@ -29,8 +28,11 @@ cleaned AS (
 ),
 final AS (
     SELECT
-        ROW_NUMBER() OVER(ORDER BY neighborhood_name) AS neighborhood_key,
-        *
+        -- Tạo Surrogate Key ổn định chống trôi khi incremental load
+        CAST(ABS(FARM_FINGERPRINT(CAST(neighborhood_id AS STRING))) AS INT64) AS neighborhood_key,
+        neighborhood_id,
+        neighborhood_name,
+        geography
     FROM cleaned
 )
 SELECT * FROM final

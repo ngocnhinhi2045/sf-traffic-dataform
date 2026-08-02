@@ -2,7 +2,7 @@ config {
     type: "table",
     schema: "sf_traffic_gold",
     name: "dim_traffic_signal",
-    description: "Traffic Signal Dimension",
+    description: "Traffic Signal Dimension (Sử dụng FARM_FINGERPRINT cho Surrogate Key an toàn)",
     tags: ["gold", "dimension"],
     assertions: {
         uniqueKey: ["signal_key"],
@@ -52,8 +52,35 @@ cleaned AS (
 ),
 final AS (
     SELECT
-        ROW_NUMBER() OVER(ORDER BY signal_id) AS signal_key,
-        *
+        -- Thay thế ROW_NUMBER() bằng FARM_FINGERPRINT để khóa không bao giờ bị trôi khi load tăng dần
+        CAST(ABS(FARM_FINGERPRINT(CAST(signal_id AS STRING))) AS INT64) AS signal_key,
+        signal_id,
+        cnn,
+        street_1,
+        street_2,
+        street_3,
+        street_4,
+        type,
+        detection,
+        system_number,
+        master,
+        bbs,
+        vehicle_actuation,
+        pedestrian_signal,
+        pedestrian_actuation,
+        tbc,
+        interconnection,
+        preemption,
+        controller_date,
+        red_light_camera,
+        start_year,
+        caltrans_route,
+        caltrans,
+        accessible_pedestrian_signal,
+        analysis_neighborhood,
+        supervisor_district,
+        sf,
+        geography
     FROM cleaned
 )
 SELECT * FROM final

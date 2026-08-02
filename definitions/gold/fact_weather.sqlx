@@ -59,8 +59,6 @@ fact_base AS (
         
         date_key,
         time_key,
-        location_id,
-        location_name,
         weather_timestamp,
         timezone,
         utc_offset_seconds,
@@ -72,8 +70,6 @@ fact_base AS (
         weathercode,
         wind_speed_10m,
         wind_gusts_10m,
-        latitude,
-        longitude,
         location_geography
     FROM map_time
 ),
