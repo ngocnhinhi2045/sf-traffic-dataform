@@ -1,0 +1,31 @@
+config {
+    type: "table",
+    schema: "sf_traffic_gold",
+    name: "dim_incident_profile",
+    description: "Junk Dimension cho các trạng thái và phân loại sự cố giao thông",
+    tags: ["gold", "dimension", "incident"],
+    assertions: {
+        uniqueKey: ["profile_key"],
+        nonNull: ["profile_key"]
+    }
+}
+
+WITH unique_profiles AS (
+    SELECT DISTINCT
+        IFNULL(TRIM(event_type), 'Unknown') AS event_type,
+        IFNULL(TRIM(status), 'Unknown') AS status,
+        IFNULL(TRIM(severity), 'Unknown') AS severity
+    FROM ${ref("slv_traffic_incident")}
+    WHERE event_type IS NOT NULL OR status IS NOT NULL OR severity IS NOT NULL
+)
+SELECT
+    -- Tạo Surrogate Key ổn định bằng hàm băm FARM_FINGERPRINT
+    CAST(ABS(FARM_FINGERPRINT(CONCAT(
+        event_type, '|', 
+        status, '|', 
+        severity
+    ))) AS INT64) AS profile_key,
+    event_type,
+    status,
+    severity
+FROM unique_profiles

@@ -75,13 +75,9 @@ standardized AS (
 -- Stage 3 : Data Cleansing
 --------------------------------------------------------------------------------
 cleaned AS (
-    SELECT 
-        s.* -- Chỉ lấy các cột của bảng standardized, bỏ qua cột của neighborhood
-    FROM standardized s
-    -- Sử dụng INNER JOIN thay cho EXISTS để BigQuery kích hoạt Spatial Join
-    JOIN ${ref("slv_neighborhood")} n
-        ON ST_INTERSECTS(s.geography, n.geography)
-    WHERE s.work_zone_id IS NOT NULL
+SELECT s.*
+FROM standardized s
+WHERE s.work_zone_id IS NOT NULL
 ),
 
 --------------------------------------------------------------------------------
